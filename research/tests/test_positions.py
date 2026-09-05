@@ -22,8 +22,7 @@ def test_answer_ranges_parse(tasks, tid, n_ranges, sheets):
 def test_whole_column_expands_to_sheet_height(tasks):
     wb = openpyxl.load_workbook(tasks["283-32"]["init_xlsx"])
     cells = sb.answer_cells(tasks["283-32"], wb)
-    # both sheets are one row tall in the init, 7 columns each
-    assert len(cells) == 14
+    assert len(cells) == 14  # both sheets are one row tall in the init, 7 columns each
     assert {s for s, _ in cells} == {"Sheet3", "Sheet4"}
 
 
@@ -40,13 +39,24 @@ def test_nbsp_prefixed_position_resolves_to_active_sheet(tasks):
     wb = openpyxl.load_workbook(task["init_xlsx"])
     cells = sb.answer_cells(task, wb)
     assert [c for _, c in cells] == ["C2", "C3"]
-    # resolution mirrors the grader: unknown sheet name -> wb.active
     sheet = cells[0][0]
     ws = wb[sheet] if sheet and sheet in wb.sheetnames else wb.active
     assert ws.title == "Sheet1"
 
 
-def test_repair_range_without_column_on_right():
+def test_all_400_positions_parse(tasks):
+    """Every task's answer_position must expand without error against its init workbook."""
+    bad = []
+    for tid, task in tasks.items():
+        try:
+            wb = openpyxl.load_workbook(task["init_xlsx"], read_only=False)
+            assert len(sb.answer_cells(task, wb)) > 0
+        except Exception as e:
+            bad.append((tid, f"{type(e).__name__}: {e}"))
+    assert not bad, bad
+
+
+def test_repair_range_and_expand():
     assert sb._repair_range("A1:3") == "A1:A3"
     assert sb._repair_range("B2:D9") == "B2:D9"
     assert sb.expand_range("A1:B2") == ["A1", "B1", "A2", "B2"]

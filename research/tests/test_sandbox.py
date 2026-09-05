@@ -1,59 +1,92 @@
-"""Model-written code runs in a subprocess and must not be able to damage the inputs."""
+"""agent/sandbox.py: model-written code runs in a subprocess inside a per-task workspace.
+
+On this branch the child only ever sees a copy of the init workbook and a key-free environment;
+both are asserted below (they are expected failures on main).
+"""
 
 import hashlib
-import sys
+from pathlib import Path
 
-from conftest import AGENT
+import openpyxl
+import pytest
 
-sys.path.insert(0, str(AGENT))
-import sandbox  # noqa: E402
+import sandbox
 
 
 def _sha(p):
-    return hashlib.sha256(open(p, "rb").read()).hexdigest()
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
 
 
-def test_script_cannot_modify_the_input_workbook(tasks, init_copy, tmp_path):
-    src = init_copy(tasks["12307"])
-    before = _sha(src)
+def _seed(task, init_copy, tmp_path):
+    src = init_copy(task)
     out = tmp_path / "out.xlsx"
-    code = """
-import sys, openpyxl
-wb = openpyxl.load_workbook(sys.argv[1]); wb.active["A1"] = "VANDALISED"; wb.save(sys.argv[1])   # tries to write the input
-wb2 = openpyxl.load_workbook(sys.argv[2]); wb2.active["I12"] = 7; wb2.save(sys.argv[2])
-"""
-    ok, log = sandbox.run_code(code, str(src), str(out), timeout=60)
-    assert ok, log
-    assert _sha(src) == before, "the dataset init workbook was modified by model code"
-    import openpyxl
+    out.write_bytes(src.read_bytes())
+    work = tmp_path / "work"
+    work.mkdir()
+    return src, out, work
+
+
+def test_run_python_edits_output_and_reports_success(tasks, init_copy, tmp_path):
+    src, out, work = _seed(tasks["12307"], init_copy, tmp_path)
+    code = "import sys, openpyxl\nwb = openpyxl.load_workbook(sys.argv[2]); wb.active['I12'] = 7; wb.save(sys.argv[2]); print('done')"
+    ok, log = sandbox.run_python(code, work_dir=work, in_xlsx=str(src), out_xlsx=str(out), turn=1, timeout=60)
+    assert ok and "done" in log
     assert openpyxl.load_workbook(out).active["I12"].value == 7
+    assert (work / "turn_01.py").exists()                       # scripts are kept in the workspace
+
+
+def test_env_carries_absolute_in_and_out_paths(tasks, init_copy, tmp_path):
+    src, out, work = _seed(tasks["12307"], init_copy, tmp_path)
+    code = "import os, pathlib\nprint(os.environ['IN_XLSX'], os.environ['OUT_XLSX'])\nassert pathlib.Path(os.environ['OUT_XLSX']).is_absolute()"
+    ok, log = sandbox.run_python(code, work_dir=work, in_xlsx=str(src), out_xlsx=str(out), turn=2, timeout=60)
+    assert ok and str(out.resolve()) in log
 
 
 def test_timeout_is_enforced(tasks, init_copy, tmp_path):
-    src = init_copy(tasks["12307"])
-    ok, log = sandbox.run_code("import time; time.sleep(30)", str(src), str(tmp_path / "o.xlsx"), timeout=2)
+    src, out, work = _seed(tasks["12307"], init_copy, tmp_path)
+    ok, log = sandbox.run_python("import time; time.sleep(30)", work_dir=work, in_xlsx=str(src), out_xlsx=str(out), turn=1, timeout=2)
     assert ok is False and "TIMEOUT" in log
 
 
+def test_nonzero_exit_is_a_failure_with_the_traceback(tasks, init_copy, tmp_path):
+    src, out, work = _seed(tasks["12307"], init_copy, tmp_path)
+    ok, log = sandbox.run_python("raise ValueError('boom')", work_dir=work, in_xlsx=str(src), out_xlsx=str(out), turn=1, timeout=30)
+    assert ok is False and "ValueError: boom" in log
+
+
 def test_deleting_output_is_a_failure(tasks, init_copy, tmp_path):
-    src = init_copy(tasks["12307"])
-    out = tmp_path / "o.xlsx"
-    ok, log = sandbox.run_code("import os, sys; os.remove(sys.argv[2])", str(src), str(out), timeout=30)
+    src, out, work = _seed(tasks["12307"], init_copy, tmp_path)
+    ok, log = sandbox.run_python("import os, sys; os.remove(sys.argv[2])", work_dir=work, in_xlsx=str(src), out_xlsx=str(out), turn=1, timeout=30)
     assert ok is False and "deleted OUT_XLSX" in log
 
 
-def test_relative_paths_are_resolved(tasks, init_copy, tmp_path, monkeypatch):
-    src = init_copy(tasks["12307"])
-    monkeypatch.chdir(tmp_path)
-    ok, log = sandbox.run_code("import sys, openpyxl; openpyxl.load_workbook(sys.argv[2]).save(sys.argv[2])",
-                               str(src.name), "rel_out.xlsx", timeout=60)
-    assert ok, log
-    assert (tmp_path / "rel_out.xlsx").exists()
+def test_run_bash_runs_in_the_workspace(tasks, init_copy, tmp_path):
+    src, out, work = _seed(tasks["12307"], init_copy, tmp_path)
+    ok, log = sandbox.run_bash("pwd; test -f \"$OUT_XLSX\" && echo present", work_dir=work, in_xlsx=str(src), out_xlsx=str(out), timeout=30)
+    assert ok and "present" in log and str(work.resolve()) in log
 
 
-def test_api_keys_are_stripped_from_the_environment(tasks, init_copy, tmp_path, monkeypatch):
+def test_script_cannot_modify_the_input_workbook(tasks, init_copy, tmp_path):
+    src, out, work = _seed(tasks["12307"], init_copy, tmp_path)
+    before = _sha(src)
+    code = "import sys, openpyxl\nwb = openpyxl.load_workbook(sys.argv[1]); wb.active['A1'] = 'VANDALISED'; wb.save(sys.argv[1])"
+    ok, _ = sandbox.run_python(code, work_dir=work, in_xlsx=str(src), out_xlsx=str(out), turn=1, timeout=60)
+    assert ok
+    assert _sha(src) == before, "model code modified the input workbook"
+
+
+def test_api_keys_do_not_reach_model_code(tasks, init_copy, tmp_path, monkeypatch):
     monkeypatch.setenv("TINKER_API_KEY", "secret-should-not-leak")
-    src = init_copy(tasks["12307"])
-    ok, log = sandbox.run_code("import os; print('KEY=' + os.environ.get('TINKER_API_KEY', 'absent'))",
-                               str(src), str(tmp_path / "o.xlsx"), timeout=30)
+    src, out, work = _seed(tasks["12307"], init_copy, tmp_path)
+    ok, log = sandbox.run_python("import os; print('KEY=' + os.environ.get('TINKER_API_KEY', 'absent'))",
+                                 work_dir=work, in_xlsx=str(src), out_xlsx=str(out), turn=1, timeout=30)
     assert ok and "KEY=absent" in log
+
+
+def test_run_code_single_shot_helper(tasks, init_copy, tmp_path):
+    src = init_copy(tasks["12307"])
+    out = tmp_path / "single.xlsx"
+    ok, log = sandbox.run_code("import sys, openpyxl\nwb = openpyxl.load_workbook(sys.argv[2]); wb.active['I12'] = 3; wb.save(sys.argv[2])",
+                               str(src), str(out), timeout=60)
+    assert ok, log
+    assert openpyxl.load_workbook(out).active["I12"].value == 3

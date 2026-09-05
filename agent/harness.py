@@ -191,7 +191,11 @@ async def complete(model, run: TaskRun, messages: list[dict], effort: str | None
     text are merged in from model.last_info). Returns None on API failure."""
     started = time.time()
     try:
-        text, tokens_in, tokens_out = await model.complete(messages, effort=effort)
+        # adapters that predate the effort knob take (messages) only; pass effort only when one is set
+        if effort is None:
+            text, tokens_in, tokens_out = await model.complete(messages)
+        else:
+            text, tokens_in, tokens_out = await model.complete(messages, effort=effort)
         extra = {k: v for k, v in getattr(model, "last_info", {}).items() if v is not None}
         run.trace(model=model.name, prompt=messages[-1]["content"], response=text, input_tokens=tokens_in,
                   output_tokens=tokens_out, latency_ms=int((time.time() - started) * 1000), **extra)
