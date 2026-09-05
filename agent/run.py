@@ -17,19 +17,38 @@ Modes:
 import argparse
 import asyncio
 import json
+import os
 import shutil
 import sys
 import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+SB_ROOT = None
 for candidate in (HERE.parent, HERE.parent / "research"):
     if (candidate / "sb.py").exists():
+        SB_ROOT = candidate
         sys.path.insert(0, str(candidate))
         break
 
 from sb import load_dataset
 from writers import append_jsonl, log
+
+
+def load_env() -> None:
+    """Local runs read keys from research/.env; in Docker they arrive via -e, so a
+    missing file is not an error."""
+    path = (SB_ROOT / ".env") if SB_ROOT else None
+    if not path or not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip().strip('"').strip("'")
+        if value:
+            os.environ.setdefault(key.strip(), value)
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,6 +126,7 @@ async def run_agent(tasks: list[dict], out_dir: Path, model_spec: str, concurren
 
 
 def main() -> None:
+    load_env()
     args = parse_args()
     out_dir = Path(args.out_dir)
     done = prepare_out_dir(out_dir, args.resume)

@@ -23,7 +23,7 @@ WORKDIR /app
 
 # dependencies first, for layer caching
 COPY research/pyproject.toml research/uv.lock ./
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev --extra tinker
 
 # code
 COPY research/sb.py sb.py
