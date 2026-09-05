@@ -1,47 +1,42 @@
 import os
+
 import openpyxl
 
-wb = openpyxl.load_workbook(os.environ["OUT_XLSX"])
+OUT = os.environ["OUT_XLSX"]
+wb = openpyxl.load_workbook(OUT)
 ws = wb["Sheet1"]
 
-# Collect the word list from column A
+# Read every word from column A.
 words = []
-for row in range(1, ws.max_row + 1):
-    v = ws.cell(row=row, column=1).value
+for r in range(1, ws.max_row + 1):
+    v = ws.cell(row=r, column=1).value
     if isinstance(v, str) and v.strip():
         words.append(v.strip())
 
-# Sort the names in column A alphabetically
+# Step 1: sort column A alphabetically, in place.
 words.sort()
 for i, w in enumerate(words, start=1):
     ws.cell(row=i, column=1).value = w
 
-word_set = set(words)
+wordset = set(words)
 
-# A word matches when moving its fifth letter to the front (EARTHPEA -> HEARTPEA)
-# produces another word that is also in the list; last three letters stay the same.
+# A match: moving the fifth letter (index 4) to the front turns the original word
+# into another listed word (EARTHPEA -> HEARTPEA). The transformation goes in C,
+# the original in D; the last three letters are unchanged so both share an ending.
 pairs = []  # (transformation, original)
 for w in words:
     if len(w) >= 5:
         t = w[4] + w[:4] + w[5:]
-        if t != w and t in word_set:
+        if t != w and t in wordset:
             pairs.append((t, w))
 
-# Group results by their endings in the requested order, alphabetical within group
-ending_order = ["ING", "ERS", "ATE", "EST", "ONE", "IER", "ILY"]
+# Group by ending in the requested order, alphabetical by original within a group.
+order = ["ING", "ERS", "ATE", "EST", "ONE", "IER", "ILY"]
+pairs.sort(key=lambda p: (order.index(p[1][-3:]) if p[1][-3:] in order else len(order), p[1]))
 
-def sort_key(pair):
-    end = pair[1][-3:]
-    idx = ending_order.index(end) if end in ending_order else len(ending_order)
-    return (idx, end, pair[1])
+# Paste the pairs at columns C and D starting on row 1, overwriting the example there.
+for i, (t, w) in enumerate(pairs, start=1):
+    ws.cell(row=i, column=3).value = t
+    ws.cell(row=i, column=4).value = w
 
-pairs.sort(key=sort_key)
-
-# Paste pairs at columns C (transformation) and D (original) starting below the example
-r = 2
-for t, w in pairs:
-    ws.cell(row=r, column=3).value = t
-    ws.cell(row=r, column=4).value = w
-    r += 1
-
-wb.save(os.environ["OUT_XLSX"])
+wb.save(OUT)
