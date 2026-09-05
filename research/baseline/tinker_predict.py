@@ -7,7 +7,11 @@
 
 Needs TINKER_API_KEY in .env. The base model picks the tokenizer and chat template. Writes the same
 files as llm_predict.py. Inference defaults live in config/qwen.yaml; command-line flags override them.
-For the local Python/Bash tool agent, use baseline/agent_predict.py instead.
+
+A reply cut off by max_tokens is never parsed as an answer: it is retried one thinking level lower
+(`fallback_renderers: auto` in the config steps xhigh -> medium -> low -> off) and recorded as an error
+if every level truncates. For the local Python/Bash tool agent, use baseline/agent_predict.py instead.
+
 """
 
 import argparse
@@ -23,6 +27,17 @@ from tinker_cookbook.model_info import get_recommended_renderer_name
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
 from sb import DEFAULT_DATASET
+
+# Qwen3.8 thinking levels from most to least reasoning; a truncated reply retries one level down.
+QWEN38_LADDER = ["qwen3_8_xhigh_reasoning", "qwen3_8_medium_reasoning", "qwen3_8_low_reasoning", "qwen3_8_disable_thinking"]
+
+
+def default_renderer(base_model: str) -> str:
+    """Start Qwen3.8 at medium thinking. The cookbook's recommended default is xhigh, which runs past any
+    practical max_tokens while still thinking; medium answers most tasks and the ladder steps down from there."""
+    if "qwen3.8" in base_model.lower():
+        return "qwen3_8_medium_reasoning"
+    return get_recommended_renderer_name(base_model)
 
 
 def load_config(path: Path) -> dict:
@@ -61,7 +76,7 @@ async def main():
     concurrency = args.concurrency if args.concurrency is not None else config.get("concurrency", 4)
     max_tokens = args.max_tokens if args.max_tokens is not None else config.get("max_tokens", 8192)
     temperature = args.temperature if args.temperature is not None else config.get("temperature", 0)
-    renderer_name = config.get("renderer") or get_recommended_renderer_name(base_model)
+    renderer_name = config.get("renderer") or default_renderer(base_model)
     print(f"Tinker project ID: {project_id or '<default project>'}", flush=True)
     sampler = tinker.ServiceClient(project_id=project_id).create_sampling_client(
         base_model=base_model, model_path=args.model_path
@@ -69,15 +84,42 @@ async def main():
     renderer = renderers.get_renderer(renderer_name, get_tokenizer(base_model))
     params = types.SamplingParams(max_tokens=max_tokens, temperature=temperature, stop=renderer.get_stop_sequences())
 
-    async def complete(prompt: str):
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt + FORMAT_HINT}]
-        model_input = renderer.build_generation_prompt(messages)
-        response = await sampler.sample_async(prompt=model_input, num_samples=1, sampling_params=params)
-        tokens = response.sequences[0].tokens
-        content = renderer.parse_response(tokens)[0]["content"]
+    # The Qwen3.8 renderers prefill the think tag, so when max_tokens is hit mid-thought the sampled text
+    # is reasoning with no answer (or a JSON cut mid-way). Detect that from the stop reason instead of
+    # handing it to the JSON parser, then step the thinking level down one notch per retry.
+    fb = config.get("fallback_renderers", "auto")
+    if fb == "auto":
+        chain = QWEN38_LADDER[QWEN38_LADDER.index(renderer_name) + 1:] if renderer_name in QWEN38_LADDER else []
+    elif fb:
+        chain = list(fb) if isinstance(fb, list) else [fb]
+    else:
+        chain = []
+    tokenizer = get_tokenizer(base_model)
+    ladder = [(renderer_name, renderer)] + [(name, renderers.get_renderer(name, tokenizer)) for name in chain]
+    print(f"renderer ladder on truncation: {' -> '.join(name for name, _ in ladder)}", flush=True)
+
+    async def sample(rnd, messages):
+        prm = types.SamplingParams(max_tokens=max_tokens, temperature=temperature, stop=rnd.get_stop_sequences())
+        model_input = rnd.build_generation_prompt(messages)
+        response = await sampler.sample_async(prompt=model_input, num_samples=1, sampling_params=prm)
+        seq = response.sequences[0]
+        tokens = seq.tokens
+        truncated = "length" in str(getattr(seq, "stop_reason", "")).lower() or len(tokens) >= max_tokens
+        content = rnd.parse_response(tokens)[0]["content"]
         if not isinstance(content, str):  # thinking renderers return parts; keep the text, drop the thinking
             content = "".join(part.get("text", "") for part in content if part.get("type") == "text")
-        return content, model_input.length, len(tokens)
+        return content, model_input.length, len(tokens), truncated
+
+    async def complete(prompt: str):
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt + FORMAT_HINT}]
+        n_in = n_out = 0
+        for name, rnd in ladder:
+            content, i, o, truncated = await sample(rnd, messages)
+            n_in, n_out = n_in + i, n_out + o
+            if not truncated:
+                return content, n_in, n_out
+        raise RuntimeError(f"reply truncated at max_tokens={max_tokens} with every renderer tried "
+                           f"({' -> '.join(name for name, _ in ladder)}): raise max_tokens")
 
     tasks = selected_tasks(Path(args.dataset_dir), parse_ids(args.ids))
     await run(complete, args.model_path or base_model, tasks, Path(args.out_dir), concurrency)

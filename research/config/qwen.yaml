@@ -2,9 +2,10 @@
 # Command-line flags override these values, e.g. --max-tokens 32768.
 base_model: Qwen/Qwen3.8-27B
 project_id: 14017256-055e-4590-a166-c4d55c6154a6
-renderer: qwen3_8_medium_reasoning
+renderer: qwen3_8_medium_reasoning   # start at medium: xhigh exhausts max_tokens while still thinking
 concurrency: 4
 max_tokens: 32768
 temperature: 0
+fallback_renderers: auto
 max_turns: 20
 tool_timeout: 120
