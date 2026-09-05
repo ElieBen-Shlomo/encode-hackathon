@@ -1,8 +1,11 @@
 """Per-task solving. Two solvers share one workbook view (`--digest`), one trace format and one
 fallback rule (every task ends with an output workbook and a predictions line):
 
-  agent   multi-turn local tool agent: the model inspects and edits the workbook through
-          inspect_workbook / run_python / run_bash / recalculate_workbook, then calls finish.
+  agent   multi-turn, verification-first local tool agent: the model inspects and edits the workbook
+          through inspect_workbook / inspect_range / assert_* / run_python / run_bash /
+          recalculate_workbook; every declared edit is diffed against the previous state, formula
+          cells in the graded range are recalculated, a review turn is required, and an optional
+          critic model must approve before finish.
   values  single call: the model returns JSON cell values, written with the baseline writer.
 """
 
@@ -26,9 +29,13 @@ for _candidate in (HERE.parent, HERE.parent / "research"):
 
 from baseline.common import FORMAT_HINT, parse_answer, write_output
 from baseline.common import SYSTEM_PROMPT as VALUES_SYSTEM
-from sandbox import run_bash, run_python, stage_input
+from digest import verification_snapshot
+from sandbox import run_bash, run_python
 from sb import answer_cells, recalculate
 from serialize import render
+from skills import selected_skills
+from verify import diff_workbooks, formula_cells, format_verification
+from workbook_tools import assert_blank, assert_sorted, inspect_range
 
 TRACE_TEXT_CAP = 20_000
 
@@ -37,14 +44,21 @@ Solve the user instruction by inspecting and editing the workbook, then finish w
 
 Reply with EXACTLY one JSON object and no prose, Markdown, or <think> tags. Valid actions are:
 {"tool":"inspect_workbook","args":{}}
-{"tool":"run_python","args":{"code":"complete Python script"}}
-{"tool":"run_bash","args":{"command":"Bash command"}}
+{"tool":"inspect_range","args":{"sheet":"Sheet1","range":"A1:E20","styles":false}}
+{"tool":"assert_sorted","args":{"sheet":"Sheet1","range":"A2:E100","keys":["A","C"]}}
+{"tool":"assert_blank","args":{"sheet":"Sheet1","range":"I295:M295"}}
+{"tool":"run_python","args":{"mode":"inspect","code":"read-only Python script"}}
+{"tool":"run_python","args":{"mode":"edit","expected_changes":["Sheet1!Q2:Q701"],"code":"complete Python script"}}
+{"tool":"run_bash","args":{"mode":"inspect","command":"read-only Bash command"}}
+{"tool":"run_bash","args":{"mode":"edit","expected_changes":["Sheet1!A1:E1102"],"command":"Bash command"}}
 {"tool":"recalculate_workbook","args":{}}
 {"tool":"finish","args":{"summary":"short completion note"}}
 
 Python and Bash run locally in a persistent task workspace. They receive IN_XLSX and OUT_XLSX environment variables and Python also receives them as argv[1] and argv[2]. OUT_XLSX begins as a copy of IN_XLSX; edit and save OUT_XLSX, never the input. Use openpyxl for workbook edits. Dates must be real datetime objects, not text. Preserve unrelated workbook content.
 
-Do not access golden workbooks, make network requests, or use web lookup. The workbook digest is incomplete; inspect the actual workbook with a tool when needed. After each tool result, choose the next JSON action. Only call finish after OUT_XLSX is ready for grading. After a successful edit, use the updated digest to verify it and call finish unless another concrete repair is needed; do not rewrite the same workbook merely to explain your work."""
+Use mode=inspect for diagnostics that do not change OUT_XLSX. Use mode=edit only when changing it, and declare the target ranges in expected_changes. For iterative rules, first run an inspect simulation that prints intermediate state before editing. “At least”, “no less than”, and equivalent boundaries are inclusive: use >= and a small float tolerance when appropriate.
+
+Do not access golden workbooks, make network requests, or use web lookup. After every successful edit, independently re-read the instruction and inspect deterministic verification plus the grading-focused snapshot. Repair any issue before finishing. The harness recalculates formula cells in the graded range automatically."""
 
 
 @dataclass
@@ -56,6 +70,11 @@ class SolveConfig:
     adaptive_small: int = 20         # adaptive: <= this many graded cells -> low, else medium
     max_turns: int = 20
     tool_timeout: int = 120
+    review_after_edit: bool = True
+    auto_recalculate_formulas: bool = True
+    verify_changes: bool = True
+    max_critic_rounds: int = 2
+    strict_critic_json: bool = True
 
 
 def effort_for(task: dict, cfg: SolveConfig) -> str | None:
@@ -82,7 +101,10 @@ def task_header(task: dict, workbook_text: str, title: str = "Workbook") -> str:
 
 def build_messages(task: dict, cfg: SolveConfig) -> tuple[list[dict], dict]:
     rendered = render_workbook(task["init_xlsx"], task, cfg)
-    user = task_header(task, rendered.text, "Initial workbook digest") + "\nStart by choosing one tool action."
+    skills = selected_skills(task["instruction"])
+    user = (task_header(task, rendered.text, "Initial workbook digest") + "\n"
+            + (f"## Relevant spreadsheet playbooks\n{skills}\n\n" if skills else "")
+            + "Start by choosing one tool action.")
     return [{"role": "system", "content": AGENT_SYSTEM}, {"role": "user", "content": user}], rendered.meta
 
 
@@ -107,8 +129,7 @@ class TaskRun:
     """Collects trace lines for one task and writes the output files."""
 
     def __init__(self, task: dict, out_dir: Path):
-        self.task = task
-        self.out_dir = out_dir
+        self.task, self.out_dir = task, out_dir
         self.out_xlsx = out_dir / "outputs" / f"{task['id']}.xlsx"
         self.trace_path = out_dir / "traces" / f"{task['id']}.jsonl"
         self.step = 0
@@ -158,6 +179,15 @@ def tool_result(messages: list[dict], tool: str, result: str) -> None:
     messages.append({"role": "user", "content": f"## Tool result: {tool}\n{_cap(result)}\n\nChoose the next JSON action."})
 
 
+def review_result(messages: list[dict], result: str) -> None:
+    messages.append({"role": "user", "content": (
+        "## Required independent review\nA workbook edit succeeded. Re-read the instruction and inspect the "
+        "verification below. For iterative tasks, manually check the first several transitions. Issue a repair "
+        "edit if anything is wrong; otherwise call finish.\n\n"
+        f"{_cap(result)}\n\nChoose exactly one JSON action."
+    )})
+
+
 def output_is_readable(path: Path) -> bool:
     try:
         openpyxl.load_workbook(path, read_only=True).close()
@@ -175,8 +205,33 @@ def recalculate_output(out_xlsx: Path, work_dir: Path) -> tuple[bool, str]:
         return False, f"{type(exc).__name__}: {exc}"
 
 
-async def solve_agent(model, task: dict, out_dir: Path, cfg: SolveConfig) -> str:
-    """Multi-turn tool conversation; always writes a prediction record and an output workbook."""
+async def ask_critic(critic, task: dict, evidence: str, run: TaskRun, *, strict_json: bool) -> tuple[bool, str]:
+    prompt = (
+        "You are an independent spreadsheet-workbook critic. Do not edit files and do not use external data. "
+        "Check exact row/column placement, formulas, data types, sort order, inclusive boundaries, and unexpected changes. "
+        "Reply with exactly one JSON object: {\"verdict\":\"approve\",\"checks\":[{\"name\":\"...\",\"status\":\"pass\",\"evidence\":\"...\"}],\"reason\":\"...\"} "
+        "or {\"verdict\":\"repair\",\"checks\":[...],\"reason\":\"specific correction\"}.\n\n"
+        f"## Instruction\n{task['instruction']}\n\n## Primary evidence\n{evidence}"
+    )
+    started = time.time()
+    try:
+        text, tokens_in, tokens_out = await critic.complete([{"role": "user", "content": prompt}])
+        run.trace(model=critic.name, prompt=prompt, response=text, input_tokens=tokens_in, output_tokens=tokens_out,
+                  latency_ms=int((time.time() - started) * 1000), tool="critic")
+        verdict = json.loads(text.strip())
+        if isinstance(verdict, dict) and verdict.get("verdict") == "approve":
+            return True, str(verdict.get("reason") or "Critic approved")
+        if isinstance(verdict, dict) and verdict.get("verdict") == "repair":
+            return False, str(verdict.get("reason") or "Critic requested repair")
+        return (not strict_json), "Critic returned an unrecognised verdict"
+    except Exception as exc:
+        run.trace(model=critic.name, prompt=prompt, tool="critic", error=f"{type(exc).__name__}: {exc}"[:500],
+                  latency_ms=int((time.time() - started) * 1000))
+        return (not strict_json), f"Critic unavailable or invalid JSON: {type(exc).__name__}: {exc}"
+
+
+async def solve_agent(model, task: dict, out_dir: Path, cfg: SolveConfig, critic=None) -> str:
+    """Verification-first tool conversation; always writes a prediction record and an output workbook."""
     run = TaskRun(task, out_dir)
     shutil.copy(task["init_xlsx"], run.out_xlsx)
     try:
@@ -190,11 +245,12 @@ async def solve_agent(model, task: dict, out_dir: Path, cfg: SolveConfig) -> str
     def digest_now() -> str:
         return render_workbook(str(run.out_xlsx), task, cfg).text
 
-    status = "error: turn limit reached"
+    status, review_pending, repair_required = "error: turn limit reached", False, False
+    edit_generation, critic_generation, critic_rounds, last_evidence = 0, -1, 0, "No edits were made."
     with tempfile.TemporaryDirectory(prefix=f"spreadsheet-agent-{task['id']}-") as temp:
         work_dir = Path(temp)
-        staged_in = stage_input(task["init_xlsx"], work_dir)   # the model's tools only ever see this copy
         for turn in range(1, cfg.max_turns + 1):
+            is_review_turn = review_pending
             text = await complete(model, run, messages, effort)
             if text is None:
                 status = "error: model call failed"
@@ -208,9 +264,30 @@ async def solve_agent(model, task: dict, out_dir: Path, cfg: SolveConfig) -> str
                 tool_result(messages, "action_parser", result)
                 status = "error: invalid action"
                 continue
+            if is_review_turn:
+                review_pending = False
 
             tool, args = action["tool"], action["args"]
             if tool == "finish":
+                if review_pending or repair_required:
+                    result = "A required review/repair is still outstanding. Issue an edit tool call before finish."
+                    run.trace(model=model.name, tool="finish", tool_input=args, tool_output=result, error="finish blocked")
+                    tool_result(messages, tool, result)
+                    status = "error: finish blocked"
+                    continue
+                if critic is not None and edit_generation and critic_generation != edit_generation:
+                    if critic_rounds >= cfg.max_critic_rounds:
+                        repair_required = True
+                        tool_result(messages, "critic", "Critic repair limit reached; make a final explicit repair.")
+                        continue
+                    critic_rounds += 1
+                    critic_generation = edit_generation
+                    approved, reason = await ask_critic(critic, task, last_evidence, run, strict_json=cfg.strict_critic_json)
+                    if not approved:
+                        repair_required, review_pending = True, True
+                        tool_result(messages, "critic", f"Critic requested repair: {reason}")
+                        status = "error: critic requested repair"
+                        continue
                 if output_is_readable(run.out_xlsx):
                     run.trace(model=model.name, tool="finish", tool_input=args, tool_output="workbook accepted")
                     run.prediction("ok")
@@ -221,29 +298,62 @@ async def solve_agent(model, task: dict, out_dir: Path, cfg: SolveConfig) -> str
                 status = "error: unreadable output"
                 continue
 
+            mode = args.get("mode", "inspect")
+            is_mutation = tool in {"run_python", "run_bash"} and mode == "edit"
+            before_edit = work_dir / f"before_{turn:02d}.xlsx"
+            if is_mutation:
+                shutil.copy(run.out_xlsx, before_edit)
+
+            # the sandbox stages a copy of the init for the child, so the dataset file is never exposed
             if tool == "inspect_workbook":
                 try:
                     ok, result = True, await asyncio.to_thread(digest_now)
                 except Exception as exc:
                     ok, result = False, f"{type(exc).__name__}: {exc}"
+            elif tool == "inspect_range":
+                ok, result = await asyncio.to_thread(inspect_range, str(run.out_xlsx), args.get("sheet", ""), args.get("range", ""),
+                                                     styles=bool(args.get("styles", False)))
+            elif tool == "assert_sorted":
+                ok, result = await asyncio.to_thread(assert_sorted, str(run.out_xlsx), args.get("sheet", ""), args.get("range", ""), args.get("keys", []))
+            elif tool == "assert_blank":
+                ok, result = await asyncio.to_thread(assert_blank, str(run.out_xlsx), args.get("sheet", ""), args.get("range", ""))
             elif tool == "run_python" and isinstance(args.get("code"), str):
-                ok, result = await asyncio.to_thread(run_python, args["code"], work_dir=work_dir, in_xlsx=staged_in,
+                ok, result = await asyncio.to_thread(run_python, args["code"], work_dir=work_dir, in_xlsx=task["init_xlsx"],
                                                      out_xlsx=str(run.out_xlsx), turn=turn, timeout=cfg.tool_timeout)
             elif tool == "run_bash" and isinstance(args.get("command"), str):
-                ok, result = await asyncio.to_thread(run_bash, args["command"], work_dir=work_dir, in_xlsx=staged_in,
+                ok, result = await asyncio.to_thread(run_bash, args["command"], work_dir=work_dir, in_xlsx=task["init_xlsx"],
                                                      out_xlsx=str(run.out_xlsx), timeout=cfg.tool_timeout)
             elif tool == "recalculate_workbook":
                 ok, result = await asyncio.to_thread(recalculate_output, run.out_xlsx, work_dir)
             else:
                 ok, result = False, f"Unknown tool or invalid args: {tool}"
 
-            if ok and tool in {"run_python", "run_bash", "recalculate_workbook"}:
+            if ok and is_mutation:
+                formulas = await asyncio.to_thread(formula_cells, str(run.out_xlsx), task)
+                if formulas and cfg.auto_recalculate_formulas:
+                    calc_ok, calc_result = await asyncio.to_thread(recalculate_output, run.out_xlsx, work_dir)
+                    result += f"\n\nAutomatic formula recalculation: {calc_result}"
+                    ok = ok and calc_ok
+                diff = await asyncio.to_thread(diff_workbooks, str(before_edit), str(run.out_xlsx), task,
+                                               args.get("expected_changes") if cfg.verify_changes else None)
+                formulas = await asyncio.to_thread(formula_cells, str(run.out_xlsx), task)
+                verification = format_verification(diff, formulas)
                 try:
-                    result += "\n\n## Updated workbook digest\n" + await asyncio.to_thread(digest_now)
+                    snapshot = await asyncio.to_thread(verification_snapshot, str(run.out_xlsx), task)
                 except Exception as exc:
-                    result += f"\n\nUnable to digest updated workbook: {type(exc).__name__}: {exc}"
+                    snapshot = f"Unable to build verification snapshot: {type(exc).__name__}: {exc}"
+                last_evidence = f"## Last tool output\n{result}\n\n{verification}\n\n{snapshot}"
+                result = last_evidence
+                edit_generation += 1
+                repair_required = False
+                if cfg.review_after_edit:
+                    review_pending = True
+
             run.trace(model=model.name, tool=tool, tool_input=args, tool_output=result, error=None if ok else "tool failed")
-            tool_result(messages, tool, result)
+            if ok and is_mutation and cfg.review_after_edit:
+                review_result(messages, result)
+            else:
+                tool_result(messages, tool, result)
             status = "error: tool failed" if not ok else "error: turn limit reached"
 
     if not output_is_readable(run.out_xlsx):
@@ -277,13 +387,17 @@ async def solve_values(model, task: dict, out_dir: Path, cfg: SolveConfig) -> st
 
 
 async def solve_task(model, task: dict, out_dir: Path, cfg: SolveConfig | None = None, *,
-                     max_turns: int | None = None, tool_timeout: int | None = None) -> str:
-    """Dispatch on cfg.mode. Keyword overrides keep research/baseline/agent_predict.py working unchanged."""
+                     max_turns: int | None = None, tool_timeout: int | None = None,
+                     review_after_edit: bool | None = None, auto_recalculate_formulas: bool | None = None,
+                     verify_changes: bool | None = None, critic=None, max_critic_rounds: int | None = None,
+                     strict_critic_json: bool | None = None) -> str:
+    """Dispatch on cfg.mode. The keyword overrides keep research/baseline/agent_predict.py working unchanged."""
     cfg = cfg or SolveConfig()
-    if max_turns is not None:
-        cfg.max_turns = max_turns
-    if tool_timeout is not None:
-        cfg.tool_timeout = tool_timeout
+    for name, value in (("max_turns", max_turns), ("tool_timeout", tool_timeout), ("review_after_edit", review_after_edit),
+                        ("auto_recalculate_formulas", auto_recalculate_formulas), ("verify_changes", verify_changes),
+                        ("max_critic_rounds", max_critic_rounds), ("strict_critic_json", strict_critic_json)):
+        if value is not None:
+            setattr(cfg, name, value)
     if cfg.mode == "values":
         return await solve_values(model, task, out_dir, cfg)
-    return await solve_agent(model, task, out_dir, cfg)
+    return await solve_agent(model, task, out_dir, cfg, critic=critic)

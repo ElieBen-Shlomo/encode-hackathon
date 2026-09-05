@@ -91,6 +91,11 @@ uv run evaluate.py --predictions submissions/my-llm/predictions.jsonl --no-recal
 Qwen can inspect a workbook and run Python, Bash, or LibreOffice recalculation
 against a copied output workbook for up to `max_turns` model turns. It writes the same predictions,
 outputs, traces, and run log as the baseline; every model and tool call is recorded in the task trace.
+The agent distinguishes read-only inspection from edits. After each declared edit it reports a workbook
+diff, answer/source snapshot, and automatically recalculates formula cells in the graded range. The
+optional critic must approve each final edit; a critic repair request blocks `finish` until another edit
+and review occur. These controls live in `config/qwen.yaml` and can be overridden with flags such as
+`--no-auto-recalculate-formulas`, `--no-verify-changes`, or `--critic-enabled`.
 
 ```sh
 uv run baseline/agent_predict.py --out-dir submissions/qwen-agent --ids 13-1,51-12

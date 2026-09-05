@@ -62,10 +62,12 @@ class MockModel:
         self.last_info = {"effort": effort, "stop_reason": "stop"}
         if any("Reply with JSON only" in str(m.get("content", "")) for m in messages):
             return MOCK_VALUES_REPLY, 0, 0                       # values solver prompt
+        completed_edit = any(m.get("role") == "user" and "Required independent review" in str(m.get("content"))
+                             for m in messages)
         tool_results = sum(m.get("role") == "user" and "Tool result" in str(m.get("content")) for m in messages)
-        if tool_results:
+        if completed_edit or tool_results >= 2:   # finish after the review turn (or if the edit path failed twice)
             return json.dumps({"tool": "finish", "args": {"summary": "mock completed"}}), 0, 0
-        return json.dumps({"tool": "run_python", "args": {"code": MOCK_TOOL_CODE}}), 0, 0
+        return json.dumps({"tool": "run_python", "args": {"mode": "edit", "expected_changes": [], "code": MOCK_TOOL_CODE}}), 0, 0
 
 
 class TinkerModel:
