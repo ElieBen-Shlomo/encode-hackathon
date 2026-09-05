@@ -16,8 +16,10 @@ OpenRouterModel compatibility adapter for the OpenRouter entrypoint.
 get_model("mock" | "tinker" | "tinker:<base>" | <openrouter id>, **kw) builds one.
 """
 
+import asyncio
 import json
 import os
+import random
 import re
 
 DEFAULT_BASE_MODEL = "Qwen/Qwen3.8-27B"
@@ -30,7 +32,16 @@ RENDERER_BY_EFFORT = {
     "xhigh": "qwen3_8_xhigh_reasoning",
 }
 EFFORTS = tuple(RENDERER_BY_EFFORT)
-DEFAULT_MAX_TOKENS = {"off": 8192, "low": 16384, "medium": 16384, "xhigh": 16384}  # off matches the reference baseline
+DEFAULT_MAX_TOKENS = {"off": 8192, "low": 32768, "medium": 32768, "xhigh": 32768}  # tokens are cheap; truncation is not
+
+TRANSIENT_MARKERS = ("429", "rate limit", "rate_limit", "too many", "timeout", "timed out", "502", "503", "504",
+                     "overloaded", "temporarily", "unavailable", "connection", "reset by peer", "eof", "capacity")
+
+
+def _is_transient(exc: Exception) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(m in text for m in TRANSIENT_MARKERS)
+
 
 MOCK_VALUES_REPLY = '{"cells": []}'
 MOCK_TOOL_CODE = "import os, openpyxl\nwb = openpyxl.load_workbook(os.environ['OUT_XLSX'])\nwb.save(os.environ['OUT_XLSX'])\n"
@@ -81,11 +92,13 @@ class TinkerModel:
 
     def __init__(self, sampler=None, renderer=None, sampling_params=None, name: str | None = None, *,
                  base_model: str = DEFAULT_BASE_MODEL, model_path: str | None = None,
-                 project_id: str | None = None, reasoning: str = "medium", max_tokens: int | None = None):
+                 project_id: str | None = None, reasoning: str = "low", max_tokens: int | None = None,
+                 retries: int = 6):
         self.last_info = {}
         self._fixed_params = None
         self._types = None
         self._tokenizer = None
+        self.retries = retries
         if sampler is not None:
             self._sampler = sampler
             self._renderers = {"default": renderer}
@@ -131,10 +144,22 @@ class TinkerModel:
         params = self._types.SamplingParams(max_tokens=max_tokens, temperature=0, stop=renderer.get_stop_sequences())
         return eff, renderer, params
 
+    async def _sample(self, model_input, params):
+        """One sampling call with exponential backoff on transient failures (throttling, timeouts, 5xx)."""
+        delay = 2.0
+        for attempt in range(1, self.retries + 1):
+            try:
+                return await self._sampler.sample_async(prompt=model_input, num_samples=1, sampling_params=params), attempt
+            except Exception as e:
+                if attempt == self.retries or not _is_transient(e):
+                    raise
+                await asyncio.sleep(min(60.0, delay) + random.uniform(0, 1))
+                delay *= 2
+
     async def complete(self, messages: list[dict], effort: str | None = None) -> tuple[str, int, int]:
         eff, renderer, params = self._resolve(effort)
         model_input = renderer.build_generation_prompt(messages)
-        response = await self._sampler.sample_async(prompt=model_input, num_samples=1, sampling_params=params)
+        response, attempts = await self._sample(model_input, params)
         seq = response.sequences[0]
         tokens = list(seq.tokens)
         stop = str(getattr(seq, "stop_reason", "") or "")
@@ -165,6 +190,7 @@ class TinkerModel:
             "stop_reason": stop or None,
             "parse_error": parse_error,
             "reasoning": reasoning,
+            "attempts": attempts if attempts > 1 else None,
         }
         return content, model_input.length, len(tokens)
 
@@ -193,7 +219,7 @@ class OpenRouterModel:
 
 
 def get_model(spec: str, *, base_model: str = DEFAULT_BASE_MODEL, model_path: str | None = None,
-              project_id: str | None = None, reasoning: str = "medium", max_tokens: int | None = None):
+              project_id: str | None = None, reasoning: str = "low", max_tokens: int | None = None, retries: int = 6):
     if spec == "mock":
         return MockModel()
     if spec == "tinker" or spec.startswith("tinker:"):
@@ -201,5 +227,5 @@ def get_model(spec: str, *, base_model: str = DEFAULT_BASE_MODEL, model_path: st
             base_model, _, path = spec[len("tinker:"):].partition("@")
             model_path = path or model_path
         return TinkerModel(base_model=base_model, model_path=model_path, project_id=project_id,
-                           reasoning=reasoning, max_tokens=max_tokens)
+                           reasoning=reasoning, max_tokens=max_tokens, retries=retries)
     return OpenRouterModel(spec)

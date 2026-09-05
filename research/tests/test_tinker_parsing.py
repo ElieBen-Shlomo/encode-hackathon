@@ -41,10 +41,10 @@ class FakeSampler:
 MSGS = [{"role": "system", "content": "sys"}, {"role": "user", "content": "prompt"}]
 
 
-def make_model(renderer, sampler, reasoning="low", max_tokens=None):
+def make_model(renderer, sampler, reasoning="low", max_tokens=None, retries=3):
     m = object.__new__(models.TinkerModel)
     m.base_model, m.model_path, m.reasoning, m.max_tokens = "Qwen/Qwen3.8-27B", None, reasoning, max_tokens
-    m.name, m.last_info, m.project_id, m._fixed_params = "tinker:test", {}, None, None
+    m.name, m.last_info, m.project_id, m._fixed_params, m.retries = "tinker:test", {}, None, None, retries
     m._types = SimpleNamespace(SamplingParams=lambda **kw: SimpleNamespace(**kw))
     m._sampler, m._tokenizer = sampler, SimpleNamespace(decode=lambda toks: "raw")
     m._renderers = {e: renderer for e in models.EFFORTS}
@@ -107,6 +107,64 @@ def test_get_model_spec_parsing_without_network(monkeypatch):
     assert models.get_model("mock").name == "mock"
     assert models.get_model("tinker", reasoning="medium") == "T" and seen["base_model"] == models.DEFAULT_BASE_MODEL
     assert models.get_model("tinker:Qwen/Qwen3-8B") == "T" and seen["base_model"] == "Qwen/Qwen3-8B"
+
+
+class FlakySampler(FakeSampler):
+    """Fails `failures` times with the given exception before answering."""
+
+    def __init__(self, tokens, stop_reason, failures, exc):
+        super().__init__(tokens, stop_reason)
+        self.failures, self.exc = failures, exc
+
+    async def sample_async(self, prompt, num_samples, sampling_params):
+        if self.failures:
+            self.failures -= 1
+            self.calls.append("fail")
+            raise self.exc
+        return await super().sample_async(prompt, num_samples, sampling_params)
+
+
+def test_transient_errors_are_retried_with_backoff(monkeypatch):
+    sleeps = []
+
+    async def fake_sleep(s):
+        sleeps.append(s)
+
+    monkeypatch.setattr(models.asyncio, "sleep", fake_sleep)
+    sampler = FlakySampler([1, 2, 3], "stop", failures=2, exc=RuntimeError("HTTP 429 Too Many Requests"))
+    m = make_model(FakeRenderer([{"type": "text", "text": "ok"}]), sampler, retries=6)
+    text, _, _ = asyncio.run(m.complete(MSGS))
+    assert text == "ok" and len(sampler.calls) == 3          # two failures, then success
+    assert m.last_info["attempts"] == 3
+    assert len(sleeps) == 2 and 2 <= sleeps[0] < 3.1 and 4 <= sleeps[1] < 5.1   # exponential with jitter
+
+
+def test_non_transient_errors_are_not_retried(monkeypatch):
+    async def fake_sleep(s):
+        pass
+
+    monkeypatch.setattr(models.asyncio, "sleep", fake_sleep)
+    sampler = FlakySampler([1], "stop", failures=1, exc=ValueError("bad renderer configuration"))
+    m = make_model(FakeRenderer([{"type": "text", "text": "ok"}]), sampler, retries=6)
+    with pytest.raises(ValueError):
+        asyncio.run(m.complete(MSGS))
+    assert sampler.calls == ["fail"]
+
+
+def test_retries_give_up_after_the_budget(monkeypatch):
+    async def fake_sleep(s):
+        pass
+
+    monkeypatch.setattr(models.asyncio, "sleep", fake_sleep)
+    sampler = FlakySampler([1], "stop", failures=10, exc=RuntimeError("503 service unavailable"))
+    m = make_model(FakeRenderer([{"type": "text", "text": "ok"}]), sampler, retries=3)
+    with pytest.raises(RuntimeError):
+        asyncio.run(m.complete(MSGS))
+    assert len(sampler.calls) == 3
+
+
+def test_default_caps_are_32k_with_thinking_and_8k_without():
+    assert models.DEFAULT_MAX_TOKENS == {"off": 8192, "low": 32768, "medium": 32768, "xhigh": 32768}
 
 
 def test_renderer_ladder_names_match_cookbook_family():

@@ -79,13 +79,16 @@ async def main() -> None:
     renderer = renderers.get_renderer(renderer_name, get_tokenizer(base_model))
     params = types.SamplingParams(max_tokens=max_tokens, temperature=temperature, stop=renderer.get_stop_sequences())
 
-    from harness import solve_task
+    from harness import SolveConfig, set_local_limits, solve_task
     from models import TinkerModel
+
+    digest = config.get("digest", "grid")
+    set_local_limits(config.get("libreoffice_concurrency"), config.get("sandbox_concurrency"))
 
     tasks = selected_tasks(Path(args.dataset_dir), parse_ids(args.ids))
     out_dir = Path(args.out_dir)
     prepare_out_dir(out_dir)
-    log(out_dir, f"mode agent  model {args.model_path or base_model}  tasks {len(tasks)}  max_turns {max_turns} "
+    log(out_dir, f"mode agent  model {args.model_path or base_model}  tasks {len(tasks)}  digest {digest}  max_turns {max_turns} "
                  f"review {review_after_edit} recalc {auto_recalculate} verify {verify_changes} critic {critic_enabled}")
     model = TinkerModel(sampler, renderer, params, args.model_path or base_model)
     critic = None
@@ -99,7 +102,8 @@ async def main() -> None:
         async with semaphore:
             try:
                 status = await solve_task(
-                    model, task, out_dir, max_turns=max_turns, tool_timeout=tool_timeout,
+                    model, task, out_dir, SolveConfig(mode="agent", digest=digest),
+                    max_turns=max_turns, tool_timeout=tool_timeout,
                     review_after_edit=review_after_edit, auto_recalculate_formulas=auto_recalculate,
                     verify_changes=verify_changes, critic=critic, max_critic_rounds=max_critic_rounds,
                     strict_critic_json=strict_critic_json,

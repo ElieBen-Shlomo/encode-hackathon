@@ -11,6 +11,7 @@ fallback rule (every task ends with an output workbook and a predictions line):
 
 import asyncio
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -39,6 +40,32 @@ from workbook_tools import assert_blank, assert_sorted, inspect_range
 
 TRACE_TEXT_CAP = 20_000
 
+# Local CPU work is bounded separately from API concurrency: at --concurrency 400 the model calls fly, but
+# 400 simultaneous LibreOffice recalculations or sandbox interpreters would thrash the machine.
+_LIMITS = {"libreoffice": max(2, os.cpu_count() or 4), "sandbox": 2 * max(2, os.cpu_count() or 4)}
+_SEMAPHORES: dict[tuple, asyncio.Semaphore] = {}
+
+
+def set_local_limits(libreoffice: int | None = None, sandbox: int | None = None) -> None:
+    if libreoffice:
+        _LIMITS["libreoffice"] = libreoffice
+    if sandbox:
+        _LIMITS["sandbox"] = sandbox
+    _SEMAPHORES.clear()
+
+
+def _sem(kind: str) -> asyncio.Semaphore:
+    key = (kind, id(asyncio.get_running_loop()))
+    if key not in _SEMAPHORES:
+        _SEMAPHORES[key] = asyncio.Semaphore(_LIMITS[kind])
+    return _SEMAPHORES[key]
+
+
+async def bounded(kind: str, fn, *args, **kwargs):
+    """Run blocking local work in a thread, holding the per-kind semaphore."""
+    async with _sem(kind):
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
 AGENT_SYSTEM = """You are an expert spreadsheet engineer operating a local workbook tool agent.
 Solve the user instruction by inspecting and editing the workbook, then finish with a valid output workbook.
 
@@ -64,9 +91,9 @@ Do not access golden workbooks, make network requests, or use web lookup. After 
 @dataclass
 class SolveConfig:
     mode: str = "agent"              # agent | values
-    digest: str = "windowed"         # any name in serialize.available()
+    digest: str = "grid"             # any name in serialize.available(); grid won the representation study
     budget_tokens: int | None = None
-    reasoning: str = "medium"        # off | low | medium | xhigh | adaptive  (Tinker backend only)
+    reasoning: str = "low"           # off | low | medium | xhigh | adaptive  (Tinker backend only)
     adaptive_small: int = 20         # adaptive: <= this many graded cells -> low, else medium
     max_turns: int = 20
     tool_timeout: int = 120
@@ -235,7 +262,7 @@ async def solve_agent(model, task: dict, out_dir: Path, cfg: SolveConfig, critic
     run = TaskRun(task, out_dir)
     shutil.copy(task["init_xlsx"], run.out_xlsx)
     try:
-        messages, meta = await asyncio.to_thread(build_messages, task, cfg)
+        messages, meta = await bounded("libreoffice", build_messages, task, cfg)
     except Exception as exc:
         return run.fail(f"error: digest failed: {exc}", error=f"digest failed: {type(exc).__name__}: {exc}")
     run.trace(tool="render", tool_input=json.dumps({"digest": cfg.digest, "budget_tokens": cfg.budget_tokens}),
@@ -307,7 +334,7 @@ async def solve_agent(model, task: dict, out_dir: Path, cfg: SolveConfig, critic
             # the sandbox stages a copy of the init for the child, so the dataset file is never exposed
             if tool == "inspect_workbook":
                 try:
-                    ok, result = True, await asyncio.to_thread(digest_now)
+                    ok, result = True, await bounded("libreoffice", digest_now)
                 except Exception as exc:
                     ok, result = False, f"{type(exc).__name__}: {exc}"
             elif tool == "inspect_range":
@@ -318,20 +345,20 @@ async def solve_agent(model, task: dict, out_dir: Path, cfg: SolveConfig, critic
             elif tool == "assert_blank":
                 ok, result = await asyncio.to_thread(assert_blank, str(run.out_xlsx), args.get("sheet", ""), args.get("range", ""))
             elif tool == "run_python" and isinstance(args.get("code"), str):
-                ok, result = await asyncio.to_thread(run_python, args["code"], work_dir=work_dir, in_xlsx=task["init_xlsx"],
+                ok, result = await bounded("sandbox", run_python, args["code"], work_dir=work_dir, in_xlsx=task["init_xlsx"],
                                                      out_xlsx=str(run.out_xlsx), turn=turn, timeout=cfg.tool_timeout)
             elif tool == "run_bash" and isinstance(args.get("command"), str):
-                ok, result = await asyncio.to_thread(run_bash, args["command"], work_dir=work_dir, in_xlsx=task["init_xlsx"],
+                ok, result = await bounded("sandbox", run_bash, args["command"], work_dir=work_dir, in_xlsx=task["init_xlsx"],
                                                      out_xlsx=str(run.out_xlsx), timeout=cfg.tool_timeout)
             elif tool == "recalculate_workbook":
-                ok, result = await asyncio.to_thread(recalculate_output, run.out_xlsx, work_dir)
+                ok, result = await bounded("libreoffice", recalculate_output, run.out_xlsx, work_dir)
             else:
                 ok, result = False, f"Unknown tool or invalid args: {tool}"
 
             if ok and is_mutation:
                 formulas = await asyncio.to_thread(formula_cells, str(run.out_xlsx), task)
                 if formulas and cfg.auto_recalculate_formulas:
-                    calc_ok, calc_result = await asyncio.to_thread(recalculate_output, run.out_xlsx, work_dir)
+                    calc_ok, calc_result = await bounded("libreoffice", recalculate_output, run.out_xlsx, work_dir)
                     result += f"\n\nAutomatic formula recalculation: {calc_result}"
                     ok = ok and calc_ok
                 diff = await asyncio.to_thread(diff_workbooks, str(before_edit), str(run.out_xlsx), task,
@@ -367,7 +394,7 @@ async def solve_values(model, task: dict, out_dir: Path, cfg: SolveConfig) -> st
     """The baseline strategy through the same view and trace: one call, JSON cell values, baseline writer."""
     run = TaskRun(task, out_dir)
     try:
-        rendered = await asyncio.to_thread(render_workbook, task["init_xlsx"], task, cfg)
+        rendered = await bounded("libreoffice", render_workbook, task["init_xlsx"], task, cfg)
     except Exception as exc:
         return run.fail(f"error: render failed: {exc}", error=f"render failed: {type(exc).__name__}: {exc}")
     run.trace(tool="render", tool_input=json.dumps({"digest": cfg.digest, "budget_tokens": cfg.budget_tokens}),

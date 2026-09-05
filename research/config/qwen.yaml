@@ -2,11 +2,14 @@
 # Command-line flags override these values, e.g. --max-tokens 32768.
 base_model: Qwen/Qwen3.8-27B
 project_id: 14017256-055e-4590-a166-c4d55c6154a6
-renderer: qwen3_8_medium_reasoning   # start at medium: xhigh exhausts max_tokens while still thinking
+renderer: qwen3_8_low_reasoning      # dev-100: low = medium = adaptive (65/64/64), fastest; xhigh truncates at any cap
 concurrency: 400
 max_tokens: 32768
 temperature: 0
 fallback_renderers: auto
+digest: grid                         # workbook view for the agent: formulas -> values, typed headers, names (dev-100: 88% vs 75% windowed)
+libreoffice_concurrency: null        # default CPU count; bounds local recalcs independently of `concurrency`
+sandbox_concurrency: null            # default 2x CPU count
 max_turns: 20
 tool_timeout: 120
 review_after_edit: true

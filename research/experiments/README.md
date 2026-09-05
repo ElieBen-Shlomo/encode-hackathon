@@ -13,6 +13,20 @@ uv run eval/make_splits.py            # eval/splits/{dev100,check50,rest250}.txt
 .venv/bin/tinker billing usage        # credit burn, check after E0 and after the thinking sweep
 ```
 
+## The configuration the study selected (now the defaults)
+
+Code agent, `grid` view, `low` thinking, 32k completion cap with the step-down ladder, 400 tasks in flight,
+local LibreOffice and sandbox work bounded to the CPU count. dev-100: 88% against 52% for the shipped setup
+(see `representation_ablation.md`). Both entry points default to it:
+
+```sh
+uv run agent/run.py --dataset-dir <data> --out-dir <out>      # flags: --digest --reasoning --max-tokens --concurrency --lo-concurrency --sandbox-concurrency --retries
+uv run baseline/agent_predict.py --out-dir <out>              # reads research/config/qwen.yaml (renderer, digest, concurrency, ...)
+```
+
+Before relying on 400 in flight, run dev-100 once at that setting and watch the `attempts` field in traces
+(retries on throttling) and tasks per minute; if Tinker throttles, lower `--concurrency`.
+
 ## Views (`--digest`) and thinking levels (`--reasoning`)
 
 | digest | what the model sees |

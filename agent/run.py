@@ -49,18 +49,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset-dir", default="/data")
     p.add_argument("--out-dir", default="/out")
     p.add_argument("--ids", help="comma-separated task ids, or @file with one id per line (default: all)")
-    p.add_argument("--concurrency", type=int, default=4)
+    p.add_argument("--concurrency", type=int, default=400, help="tasks in flight (API calls); local work is bounded separately")
+    p.add_argument("--lo-concurrency", type=int, default=None, help="simultaneous LibreOffice recalculations (default: CPU count)")
+    p.add_argument("--sandbox-concurrency", type=int, default=None, help="simultaneous Python/Bash tool processes (default: 2x CPU count)")
+    p.add_argument("--retries", type=int, default=6, help="attempts per model call on throttling or transient errors")
     p.add_argument("--mode", choices=["agent", "values", "null"], default="agent")
     p.add_argument("--model", default="tinker", help='"tinker", "tinker:<base>", "mock", or an OpenRouter model id')
     p.add_argument("--base-model", default=DEFAULT_BASE_MODEL, help="Tinker base model")
     p.add_argument("--model-path", help="tinker://... sampler checkpoint (omit to sample the base model)")
     p.add_argument("--project-id", help="Tinker project id (else TINKER_PROJECT_ID env, else the org default project)")
-    p.add_argument("--reasoning", choices=[*EFFORTS, "adaptive"], default="medium",
+    p.add_argument("--reasoning", choices=[*EFFORTS, "adaptive"], default="low",
                    help="thinking level (renderer) for the Tinker backend")
     p.add_argument("--max-turns", type=int, default=20, help="agent mode: maximum model turns per task")
     p.add_argument("--tool-timeout", type=int, default=120, help="agent mode: seconds per Python/Bash tool call")
-    p.add_argument("--max-tokens", type=int, help="completion cap (default 16384 with thinking, 6144 without)")
-    p.add_argument("--digest", default="windowed", help=f"workbook view, one of {available_digests()}")
+    p.add_argument("--max-tokens", type=int, default=32768, help="completion cap per model turn")
+    p.add_argument("--digest", default="grid", help=f"workbook view, one of {available_digests()}")
     p.add_argument("--budget", type=int, help="prompt token budget for views that support it")
     p.add_argument("--resume", action="store_true", help="skip ids already in predictions.jsonl")
     return p.parse_args()
@@ -123,11 +126,12 @@ def run_null(task: dict, out_dir: Path) -> str:
 
 
 async def run_model(tasks: list[dict], out_dir: Path, args: argparse.Namespace) -> None:
-    from harness import SolveConfig, solve_task
+    from harness import SolveConfig, set_local_limits, solve_task
     from models import get_model
 
+    set_local_limits(args.lo_concurrency, args.sandbox_concurrency)
     model = get_model(args.model, base_model=args.base_model, model_path=args.model_path,
-                      project_id=args.project_id, reasoning=args.reasoning, max_tokens=args.max_tokens)
+                      project_id=args.project_id, reasoning=args.reasoning, max_tokens=args.max_tokens, retries=args.retries)
     cfg = SolveConfig(mode=args.mode, digest=args.digest, budget_tokens=args.budget, reasoning=args.reasoning,
                       max_turns=args.max_turns, tool_timeout=args.tool_timeout)
     semaphore = asyncio.Semaphore(args.concurrency)
