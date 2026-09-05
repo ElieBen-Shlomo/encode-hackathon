@@ -1,4 +1,4 @@
-"""Same baseline through Tinker: a base model, or your fine-tuned sampler checkpoint.
+"""One-shot values-only Tinker Qwen baseline.
 
     uv sync --extra tinker
     uv run baseline/tinker_predict.py --out-dir submissions/qwen3-8b --ids 13-1,51-12
@@ -7,6 +7,7 @@
 
 Needs TINKER_API_KEY in .env. The base model picks the tokenizer and chat template. Writes the same
 files as llm_predict.py. Inference defaults live in config/qwen.yaml; command-line flags override them.
+For the local Python/Bash tool agent, use baseline/agent_predict.py instead.
 """
 
 import argparse
