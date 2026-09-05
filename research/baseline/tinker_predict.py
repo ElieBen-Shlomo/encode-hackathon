@@ -30,6 +30,14 @@ from sb import DEFAULT_DATASET
 QWEN38_LADDER = ["qwen3_8_xhigh_reasoning", "qwen3_8_medium_reasoning", "qwen3_8_low_reasoning", "qwen3_8_disable_thinking"]
 
 
+def default_renderer(base_model: str) -> str:
+    """Start Qwen3.8 at medium thinking. The cookbook's recommended default is xhigh, which runs past any
+    practical max_tokens while still thinking; medium answers most tasks and the ladder steps down from there."""
+    if "qwen3.8" in base_model.lower():
+        return "qwen3_8_medium_reasoning"
+    return get_recommended_renderer_name(base_model)
+
+
 def load_config(path: Path) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"config file not found: {path}")
@@ -66,7 +74,7 @@ async def main():
     concurrency = args.concurrency if args.concurrency is not None else config.get("concurrency", 4)
     max_tokens = args.max_tokens if args.max_tokens is not None else config.get("max_tokens", 8192)
     temperature = args.temperature if args.temperature is not None else config.get("temperature", 0)
-    renderer_name = config.get("renderer") or get_recommended_renderer_name(base_model)
+    renderer_name = config.get("renderer") or default_renderer(base_model)
     print(f"Tinker project ID: {project_id or '<default project>'}", flush=True)
     sampler = tinker.ServiceClient(project_id=project_id).create_sampling_client(
         base_model=base_model, model_path=args.model_path
