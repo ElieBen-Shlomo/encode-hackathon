@@ -8,7 +8,7 @@ import openpyxl
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import range_boundaries
 
-from sb import answer_ranges
+from sb import answer_ranges, split_sheet_field
 
 HEAD_ROWS = 30
 WINDOW = 8         # rows around the answer range
@@ -31,8 +31,8 @@ def _rows_tsv(ws, rows: list[int], cols: int) -> list[str]:
 def _answer_rows(task, sheet_title: str, max_row: int) -> set[int]:
     rows = set()
     for sheet, rng in answer_ranges(task):
-        if sheet and sheet != sheet_title:
-            continue
+        if sheet and sheet != sheet_title and sheet_title not in split_sheet_field(sheet):
+            continue  # multi-sheet fields like "A,B,C" mean the range applies to each sheet
         try:
             _, r0, _, r1 = range_boundaries(rng)
         except ValueError:
