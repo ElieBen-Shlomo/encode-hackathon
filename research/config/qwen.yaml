@@ -6,7 +6,6 @@ renderer: qwen3_8_medium_reasoning   # start at medium: xhigh exhausts max_token
 concurrency: 4
 max_tokens: 32768
 temperature: 0
-# When a reply is cut off by max_tokens, retry one thinking level lower per attempt:
-# auto = step down the Qwen3.8 ladder from `renderer` (xhigh -> medium -> low -> off);
-# or give an explicit list of renderer names; null disables retries.
 fallback_renderers: auto
+max_turns: 20
+tool_timeout: 120

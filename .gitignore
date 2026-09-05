@@ -6,3 +6,7 @@ results.json
 __pycache__/
 .env
 .venv/
+
+# datasets: raw downloads and generated train/test folders (large / reproducible)
+datasets/raw/
+datasets/400/
