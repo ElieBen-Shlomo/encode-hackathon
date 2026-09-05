@@ -1,7 +1,8 @@
 # Default settings for Qwen inference through Tinker.
 # Command-line flags override these values, e.g. --max-tokens 32768.
-base_model: Qwen/Qwen3-8B
+base_model: Qwen/Qwen3.8-27B
 project_id: 14017256-055e-4590-a166-c4d55c6154a6
+renderer: qwen3_8_medium_reasoning
 concurrency: 4
-max_tokens: 16384
+max_tokens: 32768
 temperature: 0

@@ -60,11 +60,12 @@ async def main():
     concurrency = args.concurrency if args.concurrency is not None else config.get("concurrency", 4)
     max_tokens = args.max_tokens if args.max_tokens is not None else config.get("max_tokens", 8192)
     temperature = args.temperature if args.temperature is not None else config.get("temperature", 0)
+    renderer_name = config.get("renderer") or get_recommended_renderer_name(base_model)
     print(f"Tinker project ID: {project_id or '<default project>'}", flush=True)
     sampler = tinker.ServiceClient(project_id=project_id).create_sampling_client(
         base_model=base_model, model_path=args.model_path
     )
-    renderer = renderers.get_renderer(get_recommended_renderer_name(base_model), get_tokenizer(base_model))
+    renderer = renderers.get_renderer(renderer_name, get_tokenizer(base_model))
     params = types.SamplingParams(max_tokens=max_tokens, temperature=temperature, stop=renderer.get_stop_sequences())
 
     async def complete(prompt: str):
