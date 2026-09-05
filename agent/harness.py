@@ -1,21 +1,102 @@
-"""Multi-turn, verification-first local tool agent for SpreadsheetBench tasks."""
+"""Per-task solving. Two solvers share one workbook view (`--digest`), one trace format and one
+fallback rule (every task ends with an output workbook and a predictions line):
 
+  agent   multi-turn, verification-first local tool agent: the model inspects and edits the workbook
+          through inspect_workbook / inspect_range / assert_* / run_python / run_bash /
+          recalculate_workbook; every declared edit is diffed against the previous state, formula
+          cells in the graded range are recalculated, a review turn is required, and an optional
+          critic model must approve before finish.
+  values  single call: the model returns JSON cell values, written with the baseline writer.
+"""
+
+import asyncio
+import functools
 import json
+import os
 import shutil
+import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 import openpyxl
 
-from digest import digest, verification_snapshot
+HERE = Path(__file__).resolve().parent
+for _candidate in (HERE.parent, HERE.parent / "research"):
+    if (_candidate / "sb.py").exists():
+        if str(_candidate) not in sys.path:
+            sys.path.insert(0, str(_candidate))
+        break
+
+from baseline.common import FORMAT_HINT, parse_answer, write_output
+from baseline.common import SYSTEM_PROMPT as VALUES_SYSTEM
+from digest import verification_snapshot
 from sandbox import run_bash, run_python
+from sb import answer_cells, recalculate
+from serialize import render
 from skills import selected_skills
-from sb import recalculate
 from verify import diff_workbooks, formula_cells, format_verification
 from workbook_tools import assert_blank, assert_sorted, inspect_range
 
 TRACE_TEXT_CAP = 20_000
+
+# Local CPU work is bounded separately from API concurrency: at --concurrency 400 the model calls fly, but
+# 400 simultaneous LibreOffice recalculations or sandbox interpreters would thrash the machine.
+# Each kind runs on its own thread pool sized to its limit, so a burst of 120 s sandbox waits can never fill
+# the loop's shared default executor and starve the cheap in-process reads (inspect_range, diffs, snapshots).
+_CPUS = max(2, os.cpu_count() or 4)
+_LIMITS = {"libreoffice": _CPUS, "sandbox": 2 * _CPUS, "reads": 2 * _CPUS}
+_EXECUTORS: dict[str, ThreadPoolExecutor] = {}
+_GENERATION = 0   # bumped when limits change so semaphores built for old limits are not reused
+
+
+def set_local_limits(libreoffice: int | None = None, sandbox: int | None = None, reads: int | None = None) -> None:
+    """Override the per-kind bounds (None keeps the current value; anything below 1 is an error, not a no-op)."""
+    for kind, value in (("libreoffice", libreoffice), ("sandbox", sandbox), ("reads", reads)):
+        if value is None:
+            continue
+        if int(value) < 1:
+            raise ValueError(f"{kind} concurrency must be >= 1, got {value!r}")
+        _LIMITS[kind] = int(value)
+    _reset_pools()
+
+
+def _reset_pools() -> None:
+    global _GENERATION
+    _GENERATION += 1
+    for pool in _EXECUTORS.values():
+        pool.shutdown(wait=False)
+    _EXECUTORS.clear()
+
+
+def _executor(kind: str) -> ThreadPoolExecutor:
+    if kind not in _EXECUTORS:
+        _EXECUTORS[kind] = ThreadPoolExecutor(max_workers=_LIMITS[kind], thread_name_prefix=f"local-{kind}")
+    return _EXECUTORS[kind]
+
+
+def _sem(kind: str) -> asyncio.Semaphore:
+    # Semaphores live on their loop (they are bound to it once they block), so a finished loop takes them
+    # with it instead of staying pinned in a module-level cache.
+    loop = asyncio.get_running_loop()
+    cache = getattr(loop, "_local_semaphores", None)
+    if cache is None or cache[0] != _GENERATION:
+        cache = loop._local_semaphores = (_GENERATION, {})
+    per_kind = cache[1]
+    if kind not in per_kind:
+        per_kind[kind] = asyncio.Semaphore(_LIMITS[kind])
+    return per_kind[kind]
+
+
+async def bounded(kind: str, fn, *args, **kwargs):
+    """Run blocking local work on the pool for `kind` while holding its semaphore: at most the limit run at
+    once, and nothing queues behind another kind's long subprocess waits."""
+    async with _sem(kind):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(_executor(kind), functools.partial(fn, *args, **kwargs))
+
 
 AGENT_SYSTEM = """You are an expert spreadsheet engineer operating a local workbook tool agent.
 Solve the user instruction by inspecting and editing the workbook, then finish with a valid output workbook.
@@ -39,22 +120,55 @@ Use mode=inspect for diagnostics that do not change OUT_XLSX. Use mode=edit only
 Do not access golden workbooks, make network requests, or use web lookup. After every successful edit, independently re-read the instruction and inspect deterministic verification plus the grading-focused snapshot. Repair any issue before finishing. The harness recalculates formula cells in the graded range automatically."""
 
 
-def build_messages(task: dict) -> list[dict]:
+@dataclass
+class SolveConfig:
+    mode: str = "agent"              # agent | values
+    digest: str = "grid"             # any name in serialize.available(); grid won the representation study
+    budget_tokens: int | None = None
+    reasoning: str = "low"           # off | low | medium | xhigh | adaptive  (Tinker backend only)
+    adaptive_small: int = 20         # adaptive: <= this many graded cells -> low, else medium
+    max_turns: int = 20
+    tool_timeout: int = 120
+    review_after_edit: bool = True
+    auto_recalculate_formulas: bool = True
+    verify_changes: bool = True
+    max_critic_rounds: int = 2
+    strict_critic_json: bool = True
+
+
+def effort_for(task: dict, cfg: SolveConfig) -> str | None:
+    """Per-call thinking effort. None means the model's configured default."""
+    if cfg.reasoning != "adaptive":
+        return None
+    try:
+        n = len(answer_cells(task))
+    except Exception:
+        n = 10**6
+    return "low" if n <= cfg.adaptive_small else "medium"
+
+
+def render_workbook(path: str, task: dict, cfg: SolveConfig):
+    return render(cfg.digest, path, task, cfg.budget_tokens)
+
+
+def task_header(task: dict, workbook_text: str, title: str = "Workbook") -> str:
+    return (f"## Instruction\n{task['instruction']}\n\n"
+            f"## {title}\n{workbook_text}\n\n"
+            f"## Answer range\nSheet: {task.get('answer_sheet') or 'active sheet'}\n"
+            f"Cells: {task['answer_position']}\n")
+
+
+def build_messages(task: dict, cfg: SolveConfig) -> tuple[list[dict], dict]:
+    rendered = render_workbook(task["init_xlsx"], task, cfg)
     skills = selected_skills(task["instruction"])
-    return [
-        {"role": "system", "content": AGENT_SYSTEM},
-        {"role": "user", "content": (
-            f"## Instruction\n{task['instruction']}\n\n"
-            f"## Initial workbook digest\n{digest(task['init_xlsx'], task)}\n\n"
-            f"## Graded answer range\nSheet: {task.get('answer_sheet') or 'active sheet'}\n"
-            f"Cells: {task['answer_position']}\n\n"
+    user = (task_header(task, rendered.text, "Initial workbook digest") + "\n"
             + (f"## Relevant spreadsheet playbooks\n{skills}\n\n" if skills else "")
-            + "Start by choosing one tool action."
-        )},
-    ]
+            + "Start by choosing one tool action.")
+    return [{"role": "system", "content": AGENT_SYSTEM}, {"role": "user", "content": user}], rendered.meta
 
 
 def parse_action(text: str) -> dict:
+    """Accept one object, or an object inside a Markdown fence, and validate its tool shape."""
     candidate = text.strip()
     if candidate.startswith("```") and candidate.endswith("```"):
         candidate = candidate.split("\n", 1)[1].rsplit("\n", 1)[0].strip()
@@ -71,6 +185,8 @@ def _cap(value):
 
 
 class TaskRun:
+    """Collects trace lines for one task and writes the output files."""
+
     def __init__(self, task: dict, out_dir: Path):
         self.task, self.out_dir = task, out_dir
         self.out_xlsx = out_dir / "outputs" / f"{task['id']}.xlsx"
@@ -91,13 +207,30 @@ class TaskRun:
             "id": self.task["id"], "output": f"outputs/{self.task['id']}.xlsx", "status": status,
         })
 
+    predict_line = prediction  # older name
 
-async def complete(model, run: TaskRun, messages: list[dict]) -> str | None:
+    def fail(self, status: str, error: str | None = None) -> str:
+        """Init workbook is the output, per SUBMISSION.md."""
+        shutil.copy(self.task["init_xlsx"], self.out_xlsx)
+        if error:
+            self.trace(error=error[:500])
+        self.prediction(status[:200])
+        return status[:80]
+
+
+async def complete(model, run: TaskRun, messages: list[dict], effort: str | None = None) -> str | None:
+    """One model call with its trace line (backend details such as renderer, stop reason and reasoning
+    text are merged in from model.last_info). Returns None on API failure."""
     started = time.time()
     try:
-        text, tokens_in, tokens_out = await model.complete(messages)
+        # adapters that predate the effort knob take (messages) only; pass effort only when one is set
+        if effort is None:
+            text, tokens_in, tokens_out = await model.complete(messages)
+        else:
+            text, tokens_in, tokens_out = await model.complete(messages, effort=effort)
+        extra = {k: v for k, v in getattr(model, "last_info", {}).items() if v is not None}
         run.trace(model=model.name, prompt=messages[-1]["content"], response=text, input_tokens=tokens_in,
-                  output_tokens=tokens_out, latency_ms=int((time.time() - started) * 1000))
+                  output_tokens=tokens_out, latency_ms=int((time.time() - started) * 1000), **extra)
         return text
     except Exception as exc:
         run.trace(model=model.name, prompt=messages[-1]["content"], latency_ms=int((time.time() - started) * 1000),
@@ -160,26 +293,28 @@ async def ask_critic(critic, task: dict, evidence: str, run: TaskRun, *, strict_
         return (not strict_json), f"Critic unavailable or invalid JSON: {type(exc).__name__}: {exc}"
 
 
-async def solve_task(model, task: dict, out_dir: Path, *, max_turns: int = 20, tool_timeout: int = 120,
-                     review_after_edit: bool = True, auto_recalculate_formulas: bool = True,
-                     verify_changes: bool = True, critic=None, max_critic_rounds: int = 2,
-                     strict_critic_json: bool = True) -> str:
+async def solve_agent(model, task: dict, out_dir: Path, cfg: SolveConfig, critic=None) -> str:
+    """Verification-first tool conversation; always writes a prediction record and an output workbook."""
     run = TaskRun(task, out_dir)
     shutil.copy(task["init_xlsx"], run.out_xlsx)
     try:
-        messages = build_messages(task)
+        messages, meta = await bounded("libreoffice", build_messages, task, cfg)
     except Exception as exc:
-        run.trace(error=f"digest failed: {type(exc).__name__}: {exc}"[:500])
-        run.prediction(f"error: digest failed: {exc}"[:200])
-        return "error: digest"
+        return run.fail(f"error: digest failed: {exc}", error=f"digest failed: {type(exc).__name__}: {exc}")
+    run.trace(tool="render", tool_input=json.dumps({"digest": cfg.digest, "budget_tokens": cfg.budget_tokens}),
+              tool_output=json.dumps(meta, default=str))
+    effort = effort_for(task, cfg)
+
+    def digest_now() -> str:
+        return render_workbook(str(run.out_xlsx), task, cfg).text
 
     status, review_pending, repair_required = "error: turn limit reached", False, False
     edit_generation, critic_generation, critic_rounds, last_evidence = 0, -1, 0, "No edits were made."
     with tempfile.TemporaryDirectory(prefix=f"spreadsheet-agent-{task['id']}-") as temp:
         work_dir = Path(temp)
-        for turn in range(1, max_turns + 1):
+        for turn in range(1, cfg.max_turns + 1):
             is_review_turn = review_pending
-            text = await complete(model, run, messages)
+            text = await complete(model, run, messages, effort)
             if text is None:
                 status = "error: model call failed"
                 break
@@ -204,13 +339,13 @@ async def solve_task(model, task: dict, out_dir: Path, *, max_turns: int = 20, t
                     status = "error: finish blocked"
                     continue
                 if critic is not None and edit_generation and critic_generation != edit_generation:
-                    if critic_rounds >= max_critic_rounds:
+                    if critic_rounds >= cfg.max_critic_rounds:
                         repair_required = True
                         tool_result(messages, "critic", "Critic repair limit reached; make a final explicit repair.")
                         continue
                     critic_rounds += 1
                     critic_generation = edit_generation
-                    approved, reason = await ask_critic(critic, task, last_evidence, run, strict_json=strict_critic_json)
+                    approved, reason = await ask_critic(critic, task, last_evidence, run, strict_json=cfg.strict_critic_json)
                     if not approved:
                         repair_required, review_pending = True, True
                         tool_result(messages, "critic", f"Critic requested repair: {reason}")
@@ -232,48 +367,53 @@ async def solve_task(model, task: dict, out_dir: Path, *, max_turns: int = 20, t
             if is_mutation:
                 shutil.copy(run.out_xlsx, before_edit)
 
+            # the sandbox stages a copy of the init for the child, so the dataset file is never exposed
             if tool == "inspect_workbook":
                 try:
-                    ok, result = True, digest(str(run.out_xlsx), task)
+                    ok, result = True, await bounded("libreoffice", digest_now)
                 except Exception as exc:
                     ok, result = False, f"{type(exc).__name__}: {exc}"
             elif tool == "inspect_range":
-                ok, result = inspect_range(str(run.out_xlsx), args.get("sheet", ""), args.get("range", ""), styles=bool(args.get("styles", False)))
+                ok, result = await bounded("reads", inspect_range, str(run.out_xlsx), args.get("sheet", ""), args.get("range", ""),
+                                                     styles=bool(args.get("styles", False)))
             elif tool == "assert_sorted":
-                ok, result = assert_sorted(str(run.out_xlsx), args.get("sheet", ""), args.get("range", ""), args.get("keys", []))
+                ok, result = await bounded("reads", assert_sorted, str(run.out_xlsx), args.get("sheet", ""), args.get("range", ""), args.get("keys", []))
             elif tool == "assert_blank":
-                ok, result = assert_blank(str(run.out_xlsx), args.get("sheet", ""), args.get("range", ""))
+                ok, result = await bounded("reads", assert_blank, str(run.out_xlsx), args.get("sheet", ""), args.get("range", ""))
             elif tool == "run_python" and isinstance(args.get("code"), str):
-                ok, result = run_python(args["code"], work_dir=work_dir, in_xlsx=task["init_xlsx"], out_xlsx=str(run.out_xlsx), turn=turn, timeout=tool_timeout)
+                ok, result = await bounded("sandbox", run_python, args["code"], work_dir=work_dir, in_xlsx=task["init_xlsx"],
+                                                     out_xlsx=str(run.out_xlsx), turn=turn, timeout=cfg.tool_timeout)
             elif tool == "run_bash" and isinstance(args.get("command"), str):
-                ok, result = run_bash(args["command"], work_dir=work_dir, in_xlsx=task["init_xlsx"], out_xlsx=str(run.out_xlsx), timeout=tool_timeout)
+                ok, result = await bounded("sandbox", run_bash, args["command"], work_dir=work_dir, in_xlsx=task["init_xlsx"],
+                                                     out_xlsx=str(run.out_xlsx), timeout=cfg.tool_timeout)
             elif tool == "recalculate_workbook":
-                ok, result = recalculate_output(run.out_xlsx, work_dir)
+                ok, result = await bounded("libreoffice", recalculate_output, run.out_xlsx, work_dir)
             else:
                 ok, result = False, f"Unknown tool or invalid args: {tool}"
 
             if ok and is_mutation:
-                formulas = formula_cells(str(run.out_xlsx), task)
-                if formulas and auto_recalculate_formulas:
-                    calc_ok, calc_result = recalculate_output(run.out_xlsx, work_dir)
+                formulas = await bounded("reads", formula_cells, str(run.out_xlsx), task)
+                if formulas and cfg.auto_recalculate_formulas:
+                    calc_ok, calc_result = await bounded("libreoffice", recalculate_output, run.out_xlsx, work_dir)
                     result += f"\n\nAutomatic formula recalculation: {calc_result}"
                     ok = ok and calc_ok
-                diff = diff_workbooks(str(before_edit), str(run.out_xlsx), task, args.get("expected_changes") if verify_changes else None)
-                formulas = formula_cells(str(run.out_xlsx), task)
+                diff = await bounded("reads", diff_workbooks, str(before_edit), str(run.out_xlsx), task,
+                                               args.get("expected_changes") if cfg.verify_changes else None)
+                formulas = await bounded("reads", formula_cells, str(run.out_xlsx), task)
                 verification = format_verification(diff, formulas)
                 try:
-                    snapshot = verification_snapshot(str(run.out_xlsx), task)
+                    snapshot = await bounded("reads", verification_snapshot, str(run.out_xlsx), task)
                 except Exception as exc:
                     snapshot = f"Unable to build verification snapshot: {type(exc).__name__}: {exc}"
                 last_evidence = f"## Last tool output\n{result}\n\n{verification}\n\n{snapshot}"
                 result = last_evidence
                 edit_generation += 1
                 repair_required = False
-                if review_after_edit:
+                if cfg.review_after_edit:
                     review_pending = True
 
             run.trace(model=model.name, tool=tool, tool_input=args, tool_output=result, error=None if ok else "tool failed")
-            if ok and is_mutation and review_after_edit:
+            if ok and is_mutation and cfg.review_after_edit:
                 review_result(messages, result)
             else:
                 tool_result(messages, tool, result)
@@ -284,3 +424,43 @@ async def solve_task(model, task: dict, out_dir: Path, *, max_turns: int = 20, t
         status = "error: output unreadable"
     run.prediction(status[:200])
     return status
+
+
+async def solve_values(model, task: dict, out_dir: Path, cfg: SolveConfig) -> str:
+    """The baseline strategy through the same view and trace: one call, JSON cell values, baseline writer."""
+    run = TaskRun(task, out_dir)
+    try:
+        rendered = await bounded("libreoffice", render_workbook, task["init_xlsx"], task, cfg)
+    except Exception as exc:
+        return run.fail(f"error: render failed: {exc}", error=f"render failed: {type(exc).__name__}: {exc}")
+    run.trace(tool="render", tool_input=json.dumps({"digest": cfg.digest, "budget_tokens": cfg.budget_tokens}),
+              tool_output=json.dumps(rendered.meta, default=str))
+    messages = [{"role": "system", "content": VALUES_SYSTEM},
+                {"role": "user", "content": task_header(task, rendered.text) + FORMAT_HINT}]
+    text = await complete(model, run, messages, effort_for(task, cfg))
+    if text is None:
+        return run.fail("error: model call failed")
+    try:
+        answer = parse_answer(text)
+        write_output(task, answer, run.out_xlsx)
+    except Exception as exc:
+        return run.fail(f"error: {exc}", error=f"values write failed: {type(exc).__name__}: {exc}")
+    run.prediction("ok")
+    return "ok"
+
+
+async def solve_task(model, task: dict, out_dir: Path, cfg: SolveConfig | None = None, *,
+                     max_turns: int | None = None, tool_timeout: int | None = None,
+                     review_after_edit: bool | None = None, auto_recalculate_formulas: bool | None = None,
+                     verify_changes: bool | None = None, critic=None, max_critic_rounds: int | None = None,
+                     strict_critic_json: bool | None = None) -> str:
+    """Dispatch on cfg.mode. The keyword overrides keep research/baseline/agent_predict.py working unchanged."""
+    cfg = cfg or SolveConfig()
+    for name, value in (("max_turns", max_turns), ("tool_timeout", tool_timeout), ("review_after_edit", review_after_edit),
+                        ("auto_recalculate_formulas", auto_recalculate_formulas), ("verify_changes", verify_changes),
+                        ("max_critic_rounds", max_critic_rounds), ("strict_critic_json", strict_critic_json)):
+        if value is not None:
+            setattr(cfg, name, value)
+    if cfg.mode == "values":
+        return await solve_values(model, task, out_dir, cfg)
+    return await solve_agent(model, task, out_dir, cfg, critic=critic)

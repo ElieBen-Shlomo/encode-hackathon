@@ -2,6 +2,7 @@ import datetime
 import json
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 from pathlib import Path
@@ -132,6 +133,21 @@ def soffice_path():
     return None
 
 
+def _kill_process_group(proc):
+    """SIGKILL a child started with start_new_session=True and all of its descendants, then reap it."""
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:  # pragma: no cover
+            proc.kill()
+    except ProcessLookupError:
+        pass
+    try:
+        proc.communicate(timeout=5)
+    except Exception:
+        pass
+
+
 def recalculate(xlsx_path, out_dir):
     """Recalculate every formula in xlsx_path with LibreOffice headless, write the result to out_dir."""
     exe = soffice_path()
@@ -140,11 +156,17 @@ def recalculate(xlsx_path, out_dir):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as profile:
-        subprocess.run(
-            [exe, f"-env:UserInstallation={Path(profile).resolve().as_uri()}", "--headless", "--calc",
-             "--convert-to", "xlsx:Calc MS Excel 2007 XML", "--outdir", str(out_dir), str(xlsx_path)],
-            check=True, capture_output=True, text=True, timeout=180,
-        )
+        cmd = [exe, f"-env:UserInstallation={Path(profile).resolve().as_uri()}", "--headless", "--norestore", "--calc",
+               "--convert-to", "xlsx:Calc MS Excel 2007 XML", "--outdir", str(out_dir), str(xlsx_path)]
+        # own process group: on timeout the whole soffice tree dies before the profile directory is removed
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        try:
+            out, err = proc.communicate(timeout=180)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(proc)
+            raise
+        if proc.returncode:
+            raise subprocess.CalledProcessError(proc.returncode, cmd, out, err)
     return out_dir / Path(xlsx_path).name
 
 

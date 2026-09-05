@@ -71,8 +71,6 @@ def test_thinking_only_reply_yields_empty_text():
     assert asyncio.run(m.complete(MSGS))[0] == ""
 
 
-@pytest.mark.xfail(strict=True, reason="a reply cut off by max_tokens mid-JSON is returned as if complete; the adapter should "
-                                      "check stop_reason/length and surface a truncation error instead (see PR #11)")
 def test_truncated_json_reply_is_not_returned_as_the_answer():
     parts = [{"type": "text", "text": '{"tool":"run_python","args":{"code":"import ope'}]   # cut mid-way
     m = models.TinkerModel(FakeSampler([1] * 100, "length"), FakeRenderer(parts), SimpleNamespace(max_tokens=100), "n")

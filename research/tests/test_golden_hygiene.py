@@ -19,8 +19,9 @@ ALLOWED_TO_MENTION_GOLDEN = {
     RESEARCH / "tests" / "conftest.py",       # pops the field so no test can see a golden path
     RESEARCH / "tests" / "test_golden_hygiene.py",
     RESEARCH / "tests" / "test_scorer.py",
+    RESEARCH / "experiments" / "teacher_prepare.py",   # only to pop the field before anything sees it
 }
-SCAN_DIRS = [AGENT, RESEARCH / "baseline", RESEARCH / "tests"]
+SCAN_DIRS = [AGENT, RESEARCH / "baseline", RESEARCH / "eval", RESEARCH / "experiments", RESEARCH / "tests"]
 CODE_PATTERN = re.compile(r"golden_xlsx|load_answer_values|\*golden\*|golden\.xlsx", re.I)
 
 
@@ -36,7 +37,7 @@ def test_no_pipeline_code_touches_golden_files():
     offenders = []
     for d in SCAN_DIRS:
         for f in d.rglob("*.py"):
-            if f in ALLOWED_TO_MENTION_GOLDEN or "__pycache__" in f.parts:
+            if f in ALLOWED_TO_MENTION_GOLDEN or "__pycache__" in f.parts or ".venv" in f.parts:
                 continue
             for i, line in enumerate(_code_lines(f), 1):
                 if CODE_PATTERN.search(line):
@@ -65,3 +66,7 @@ def test_mock_agent_run_never_opens_a_golden_path(tasks, out_dir, monkeypatch):
     assert opened, "the spy saw no file access; the test is not exercising the pipeline"
     bad = [p for p in opened if "golden" in p.lower()]
     assert not bad, bad
+
+
+def test_show_py_is_excluded_from_the_docker_image():
+    assert "agent/show.py" in (RESEARCH.parent / ".dockerignore").read_text()

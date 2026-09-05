@@ -8,6 +8,9 @@ run_python action carrying the script, the real tool result (the script is execu
 the updated digest appended, like harness.solve_task does), an optional recalculate_workbook
 turn when the script wrote formulas whose values need LibreOffice, then finish.
 
+The workbook view is the one the harness serves at inference (`SolveConfig()`, i.e. the shipped
+`--digest`, grid), so the fine-tune never trains on one view and answers on another.
+
 Test-split ids are refused outright (DATA_PLAN: the test split is sealed).
 """
 
@@ -22,8 +25,7 @@ sys.path.insert(0, str(HERE.parent))                    # research: sb
 sys.path.insert(0, str(HERE.parent.parent / "agent"))   # agent: harness, digest, sandbox
 
 import openpyxl
-from digest import digest
-from harness import build_messages, tool_result
+from harness import SolveConfig, build_messages, render_workbook, tool_result
 from sandbox import run_python
 from sb import load_answer_values, load_dataset, recalculate
 
@@ -58,7 +60,12 @@ def needs_recalc(out_xlsx: Path, task: dict) -> bool:
     return False
 
 
-def trajectory(task: dict, script: str) -> list[dict] | None:
+def trajectory(task: dict, script: str, cfg: SolveConfig | None = None) -> list[dict] | None:
+    cfg = cfg or SolveConfig()
+
+    def view(path: Path) -> str:
+        return render_workbook(str(path), task, cfg).text
+
     with tempfile.TemporaryDirectory(prefix=f"sft-{task['id']}-") as temp:
         work = Path(temp)
         in_copy = work / Path(task["init_xlsx"]).name
@@ -71,9 +78,9 @@ def trajectory(task: dict, script: str) -> list[dict] | None:
                                 out_xlsx=str(out), turn=1, timeout=120)
         if not ok:
             return None  # verified earlier; a replay failure means environment drift — skip loudly
-        result += "\n\n## Updated workbook digest\n" + digest(str(out), task)
+        result += "\n\n## Updated workbook digest\n" + view(out)
 
-        messages = build_messages(task)
+        messages, _meta = build_messages(task, cfg)
         messages.append({"role": "assistant",
                          "content": json.dumps({"tool": "run_python", "args": {"code": script}}, ensure_ascii=False)})
         tool_result(messages, "run_python", result)
@@ -84,7 +91,7 @@ def trajectory(task: dict, script: str) -> list[dict] | None:
             recalced = recalculate(str(out), work / "recalc")
             shutil.copy(recalced, out)
             tool_result(messages, "recalculate_workbook",
-                        "LibreOffice recalculation completed\n\n## Updated workbook digest\n" + digest(str(out), task))
+                        "LibreOffice recalculation completed\n\n## Updated workbook digest\n" + view(out))
 
         messages.append({"role": "assistant",
                          "content": json.dumps({"tool": "finish",

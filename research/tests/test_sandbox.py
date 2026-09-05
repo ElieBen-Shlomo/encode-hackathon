@@ -1,11 +1,14 @@
 """agent/sandbox.py: model-written code runs in a subprocess inside a per-task workspace.
 
-Two strict expected-failures document safety properties the current sandbox does not provide:
-the child receives the real input workbook path (so it can modify the dataset), and it inherits
-the full environment including API keys.
+On this branch the child only ever sees a copy of the init workbook and a key-free environment;
+both are asserted below (they are expected failures on main).
 """
 
 import hashlib
+import subprocess
+import sys
+import time
+import uuid
 from pathlib import Path
 
 import openpyxl
@@ -61,14 +64,25 @@ def test_deleting_output_is_a_failure(tasks, init_copy, tmp_path):
     assert ok is False and "deleted OUT_XLSX" in log
 
 
+def test_timeout_kills_grandchildren_too(tasks, init_copy, tmp_path):
+    """A bash command that backgrounds a Python child: the timeout must take the whole process group down,
+    or the orphan keeps running outside the sandbox bound."""
+    src, out, work = _seed(tasks["12307"], init_copy, tmp_path)
+    marker = f"sandbox_orphan_{uuid.uuid4().hex}"
+    cmd = f'("{sys.executable}" -c "import time; time.sleep(30)  # {marker}") & wait'
+    ok, log = sandbox.run_bash(cmd, work_dir=work, in_xlsx=str(src), out_xlsx=str(out), timeout=2)
+    assert ok is False and "TIMEOUT" in log
+    time.sleep(0.3)
+    survivors = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True).stdout.split()
+    assert not survivors, f"processes outlived the timeout: {survivors}"
+
+
 def test_run_bash_runs_in_the_workspace(tasks, init_copy, tmp_path):
     src, out, work = _seed(tasks["12307"], init_copy, tmp_path)
     ok, log = sandbox.run_bash("pwd; test -f \"$OUT_XLSX\" && echo present", work_dir=work, in_xlsx=str(src), out_xlsx=str(out), timeout=30)
     assert ok and "present" in log and str(work.resolve()) in log
 
 
-@pytest.mark.xfail(strict=True, reason="the child gets the real input path as argv[1]/IN_XLSX; model code can modify the dataset. "
-                                      "Fix: stage a copy of the init into the workspace and pass that (see PR #11)")
 def test_script_cannot_modify_the_input_workbook(tasks, init_copy, tmp_path):
     src, out, work = _seed(tasks["12307"], init_copy, tmp_path)
     before = _sha(src)
@@ -78,11 +92,18 @@ def test_script_cannot_modify_the_input_workbook(tasks, init_copy, tmp_path):
     assert _sha(src) == before, "model code modified the input workbook"
 
 
-@pytest.mark.xfail(strict=True, reason="_env copies os.environ wholesale, so TINKER_API_KEY and friends reach model-written code. "
-                                      "Fix: drop *API_KEY*/*TOKEN* variables from the child env (see PR #11)")
 def test_api_keys_do_not_reach_model_code(tasks, init_copy, tmp_path, monkeypatch):
     monkeypatch.setenv("TINKER_API_KEY", "secret-should-not-leak")
     src, out, work = _seed(tasks["12307"], init_copy, tmp_path)
     ok, log = sandbox.run_python("import os; print('KEY=' + os.environ.get('TINKER_API_KEY', 'absent'))",
                                  work_dir=work, in_xlsx=str(src), out_xlsx=str(out), turn=1, timeout=30)
     assert ok and "KEY=absent" in log
+
+
+def test_run_code_single_shot_helper(tasks, init_copy, tmp_path):
+    src = init_copy(tasks["12307"])
+    out = tmp_path / "single.xlsx"
+    ok, log = sandbox.run_code("import sys, openpyxl\nwb = openpyxl.load_workbook(sys.argv[2]); wb.active['I12'] = 3; wb.save(sys.argv[2])",
+                               str(src), str(out), timeout=60)
+    assert ok, log
+    assert openpyxl.load_workbook(out).active["I12"].value == 3

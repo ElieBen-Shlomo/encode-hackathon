@@ -51,8 +51,9 @@ def test_agent_mode_with_mock_follows_edit_review_finish(dataset_dir, tmp_path):
         assert [r["step"] for r in trace] == list(range(1, len(trace) + 1))
         model_calls = [r for r in trace if r.get("model") == "mock" and not r.get("tool")]
         assert model_calls[0]["prompt"].startswith("## Instruction")
-        tools = [r["tool"] for r in trace if r.get("tool")]
+        tools = [r["tool"] for r in trace if r.get("tool") and r["tool"] != "render"]   # this branch traces the view first
         assert tools[0] == "run_python" and tools[-1] == "finish"
+        assert trace[0]["tool"] == "render" and json.loads(trace[0]["tool_output"])["digest"] == "grid"
         edit = next(r for r in trace if r.get("tool") == "run_python")
         assert "## Deterministic verification" in edit["tool_output"]
         assert "## Graded answer cells" in edit["tool_output"]
@@ -98,7 +99,7 @@ def test_model_failure_still_writes_prediction_and_output(tasks, out_dir):
     preds = read_jsonl(out_dir / "predictions.jsonl")
     assert preds[0]["id"] == "12307" and preds[0]["status"].startswith("error")
     assert (out_dir / "outputs" / "12307.xlsx").exists()          # init copied as the output
-    rec = read_jsonl(out_dir / "traces" / "12307.jsonl")[0]
+    rec = next(r for r in read_jsonl(out_dir / "traces" / "12307.jsonl") if r.get("error"))   # the render record comes first
     assert rec["error"].startswith("RuntimeError")
 
 
@@ -120,7 +121,7 @@ def test_finish_is_blocked_while_review_is_pending(tasks, out_dir):
     status = asyncio.run(harness.solve_task(Impatient(), tasks["12307"], out_dir, max_turns=6))
     assert status == "ok"
     trace = read_jsonl(out_dir / "traces" / "12307.jsonl")
-    tools = [r.get("tool") for r in trace if r.get("tool")]
+    tools = [r.get("tool") for r in trace if r.get("tool") and r["tool"] != "render"]
     assert tools == ["run_python", "finish"]  # the review turn consumed the first finish; no "finish blocked" needed
 
 
@@ -139,3 +140,35 @@ def test_invalid_action_is_reported_and_loop_continues(tasks, out_dir):
     assert status == "ok"
     trace = read_jsonl(out_dir / "traces" / "12307.jsonl")
     assert any(r.get("tool") == "action_parser" and r.get("error") == "invalid action" for r in trace)
+
+
+def test_values_mode_end_to_end_with_mock(dataset_dir, tmp_path):
+    proc = run_pipeline(tmp_path, "values")
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    preds = read_jsonl(tmp_path / "predictions.jsonl")
+    assert sorted(p["id"] for p in preds) == sorted(MOCK_IDS) and all(p["status"] == "ok" for p in preds)
+    for tid in MOCK_IDS:
+        trace = read_jsonl(tmp_path / "traces" / f"{tid}.jsonl")
+        assert trace[0]["tool"] == "render"
+        call = next(r for r in trace if r.get("model") == "mock")
+        assert "Reply with JSON only" in call["prompt"] and call["response"] == '{"cells": []}'
+
+
+def test_resume_removes_stale_traces_of_interrupted_tasks(dataset_dir, tmp_path):
+    assert run_pipeline(tmp_path, "values").returncode == 0
+    preds = read_jsonl(tmp_path / "predictions.jsonl")
+    last = preds[-1]["id"]
+    (tmp_path / "predictions.jsonl").write_text("".join(json.dumps(p) + "\n" for p in preds[:-1]), encoding="utf-8")
+    stale = tmp_path / "traces" / f"{last}.jsonl"
+    stale.write_text(stale.read_text() + json.dumps({"step": 99, "model": "stale"}) + "\n")
+    assert run_pipeline(tmp_path, "values", extra=["--resume"]).returncode == 0
+    trace = read_jsonl(stale)
+    assert all(r.get("model") != "stale" for r in trace)
+    assert [r["step"] for r in trace] == list(range(1, len(trace) + 1))
+
+
+def test_adaptive_effort_by_graded_size(tasks):
+    cfg = harness.SolveConfig(reasoning="adaptive")
+    assert harness.effort_for(tasks["12307"], cfg) == "low"      # 2 cells
+    assert harness.effort_for(tasks["17-35"], cfg) == "medium"   # 1450 cells
+    assert harness.effort_for(tasks["12307"], harness.SolveConfig(reasoning="low")) is None

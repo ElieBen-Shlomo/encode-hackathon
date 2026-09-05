@@ -14,3 +14,5 @@ datasets/400/
 # Reproducible, potentially large LoRA experiment outputs.
 research/training/artifacts/
 research/training/runs/
+!/results.json
+research/eval/task_features.csv

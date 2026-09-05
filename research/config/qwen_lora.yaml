@@ -2,7 +2,7 @@
 # `train_lora.py --dry-run` reads this safely without creating a Tinker session.
 base_model: Qwen/Qwen3.8-27B
 project_id: 14017256-055e-4590-a166-c4d55c6154a6
-renderer: qwen3_8_medium_reasoning
+renderer: qwen3_8_low_reasoning      # must match `renderer` in qwen.yaml: the checkpoint is served with the renderer it was trained with
 rank: 16
 learning_rate: 0.0001
 epochs: 2

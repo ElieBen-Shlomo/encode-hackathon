@@ -1,0 +1,300 @@
+"""TinkerModel's reply handling against a fake sampler and fake renderers: no network, no key.
+
+The Qwen3.8 renderers prefill the think tag, so a completion cut off by max_tokens is thinking
+text with no answer. That must never be returned as the reply."""
+
+import asyncio
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+from conftest import AGENT
+
+sys.path.insert(0, str(AGENT))
+import models  # noqa: E402
+
+
+class FakeRenderer:
+    def __init__(self, parts, is_clean=True):
+        self.parts, self.is_clean = parts, is_clean
+
+    def build_generation_prompt(self, messages):
+        return SimpleNamespace(length=123, messages=messages)
+
+    def get_stop_sequences(self):
+        return ["<|im_end|>"]
+
+    def parse_response(self, tokens):
+        return ({"role": "assistant", "content": self.parts}, SimpleNamespace(is_clean=self.is_clean))
+
+
+class FakeSampler:
+    def __init__(self, tokens, stop_reason):
+        self.tokens, self.stop_reason, self.calls = tokens, stop_reason, []
+
+    async def sample_async(self, prompt, num_samples, sampling_params):
+        self.calls.append(sampling_params)
+        return SimpleNamespace(sequences=[SimpleNamespace(tokens=self.tokens, stop_reason=self.stop_reason)])
+
+
+MSGS = [{"role": "system", "content": "sys"}, {"role": "user", "content": "prompt"}]
+
+
+def make_model(renderer, sampler, reasoning="low", max_tokens=None, retries=3):
+    m = object.__new__(models.TinkerModel)
+    m.base_model, m.model_path, m.reasoning, m.max_tokens = "Qwen/Qwen3.8-27B", None, reasoning, max_tokens
+    m.name, m.last_info, m.project_id, m._fixed_params, m.retries = "tinker:test", {}, None, None, retries
+    m.call_timeout, m.temperature, m.step_down = None, 0, True
+    m._types = SimpleNamespace(SamplingParams=lambda **kw: SimpleNamespace(**kw))
+    m._sampler, m._tokenizer = sampler, SimpleNamespace(decode=lambda toks: "raw")
+    m._renderers = {e: renderer for e in models.EFFORTS}
+    m._renderer_names = dict(models.RENDERER_BY_EFFORT)
+    m._default_effort = reasoning if reasoning in models.EFFORTS else "medium"
+    return m
+
+
+def test_clean_reply_returns_text_and_keeps_reasoning_for_the_trace():
+    parts = [{"type": "thinking", "thinking": "let me count"}, {"type": "text", "text": '{"cells": []}'}]
+    m = make_model(FakeRenderer(parts), FakeSampler(list(range(40)), "stop"))
+    text, n_in, n_out = asyncio.run(m.complete(MSGS))
+    assert text == '{"cells": []}' and (n_in, n_out) == (123, 40)
+    assert m.last_info["reasoning"] == "let me count"
+    assert m.last_info["renderer"] == "qwen3_8_low_reasoning" and m.last_info["parse_error"] is None
+
+
+def test_truncated_reply_is_never_returned_as_the_answer():
+    parts = [{"type": "thinking", "thinking": "We need answer user's request. Need compute..."}]
+    m = make_model(FakeRenderer(parts, is_clean=False), FakeSampler(list(range(8192)), "length"), max_tokens=8192)
+    m.step_down = False                                 # the ladder has its own tests below; this one pins the guard
+    text, _, n_out = asyncio.run(m.complete(MSGS))
+    assert text == ""                                   # nothing for the JSON parser to misread
+    assert n_out == 8192
+    assert "truncated at max_tokens=8192" in m.last_info["parse_error"]
+    assert m.last_info["stop_reason"] == "length"
+    assert "We need answer" in m.last_info["reasoning"]  # the thinking still reaches the trace
+
+
+def test_length_stop_reason_alone_is_enough_to_flag_truncation():
+    parts = [{"type": "text", "text": '{"cells": [{"cell": "A1", "va'}]  # JSON cut mid-way
+    m = make_model(FakeRenderer(parts, is_clean=True), FakeSampler([1] * 100, "length"), max_tokens=100)
+    text, _, _ = asyncio.run(m.complete(MSGS))
+    assert text == "" and "truncated" in m.last_info["parse_error"]
+
+
+def test_effort_override_selects_renderer_and_default_caps():
+    m = make_model(FakeRenderer([{"type": "text", "text": "ok"}]), FakeSampler([1], "stop"), reasoning="low")
+    asyncio.run(m.complete(MSGS, effort="xhigh"))
+    assert m.last_info["effort"] == "xhigh" and m.last_info["max_tokens"] == models.DEFAULT_MAX_TOKENS["xhigh"]
+    asyncio.run(m.complete(MSGS, effort="off"))
+    assert m.last_info["max_tokens"] == 8192  # matches the shipped baseline's cap
+    assert m._sampler.calls[-1].temperature == 0
+
+
+def test_prebuilt_constructor_used_by_agent_predict_keeps_fixed_params_and_flags_truncation():
+    """research/baseline/agent_predict.py builds TinkerModel(sampler, renderer, params, name) positionally."""
+    params = SimpleNamespace(max_tokens=50, temperature=0)
+    sampler = FakeSampler([1] * 50, "length")
+    m = models.TinkerModel(sampler, FakeRenderer([{"type": "text", "text": "cut off"}]), params, "tinker:Qwen/Qwen3.8-27B")
+    text, n_in, n_out = asyncio.run(m.complete(MSGS))
+    assert sampler.calls[-1] is params and n_out == 50
+    assert text == "" and "truncated at max_tokens=50" in m.last_info["parse_error"]
+    m2 = models.TinkerModel(FakeSampler([1, 2, 3], "stop"), FakeRenderer([{"type": "text", "text": "ok"}]), params, "n")
+    assert asyncio.run(m2.complete(MSGS))[0] == "ok"
+
+
+def test_get_model_spec_parsing_without_network(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(models, "TinkerModel", lambda **kw: seen.update(kw) or "T")
+    assert models.get_model("mock").name == "mock"
+    assert models.get_model("tinker", reasoning="medium") == "T" and seen["base_model"] == models.DEFAULT_BASE_MODEL
+    assert models.get_model("tinker:Qwen/Qwen3-8B") == "T" and seen["base_model"] == "Qwen/Qwen3-8B"
+
+
+class FlakySampler(FakeSampler):
+    """Fails `failures` times with the given exception before answering."""
+
+    def __init__(self, tokens, stop_reason, failures, exc):
+        super().__init__(tokens, stop_reason)
+        self.failures, self.exc = failures, exc
+
+    async def sample_async(self, prompt, num_samples, sampling_params):
+        if self.failures:
+            self.failures -= 1
+            self.calls.append("fail")
+            raise self.exc
+        return await super().sample_async(prompt, num_samples, sampling_params)
+
+
+def test_transient_errors_are_retried_with_backoff(monkeypatch):
+    sleeps = []
+
+    async def fake_sleep(s):
+        sleeps.append(s)
+
+    monkeypatch.setattr(models.asyncio, "sleep", fake_sleep)
+    sampler = FlakySampler([1, 2, 3], "stop", failures=2, exc=RuntimeError("HTTP 429 Too Many Requests"))
+    m = make_model(FakeRenderer([{"type": "text", "text": "ok"}]), sampler, retries=6)
+    text, _, _ = asyncio.run(m.complete(MSGS))
+    assert text == "ok" and len(sampler.calls) == 3          # two failures, then success
+    assert m.last_info["attempts"] == 3
+    assert len(sleeps) == 2 and 2 <= sleeps[0] < 3.1 and 4 <= sleeps[1] < 5.1   # exponential with jitter
+
+
+def test_non_transient_errors_are_not_retried(monkeypatch):
+    async def fake_sleep(s):
+        pass
+
+    monkeypatch.setattr(models.asyncio, "sleep", fake_sleep)
+    sampler = FlakySampler([1], "stop", failures=1, exc=ValueError("bad renderer configuration"))
+    m = make_model(FakeRenderer([{"type": "text", "text": "ok"}]), sampler, retries=6)
+    with pytest.raises(ValueError):
+        asyncio.run(m.complete(MSGS))
+    assert sampler.calls == ["fail"]
+
+
+def test_retries_give_up_after_the_budget(monkeypatch):
+    async def fake_sleep(s):
+        pass
+
+    monkeypatch.setattr(models.asyncio, "sleep", fake_sleep)
+    sampler = FlakySampler([1], "stop", failures=10, exc=RuntimeError("503 service unavailable"))
+    m = make_model(FakeRenderer([{"type": "text", "text": "ok"}]), sampler, retries=3)
+    with pytest.raises(RuntimeError):
+        asyncio.run(m.complete(MSGS))
+    assert len(sampler.calls) == 3
+
+
+def test_default_caps_are_32k_with_thinking_and_8k_without():
+    assert models.DEFAULT_MAX_TOKENS == {"off": 8192, "low": 32768, "medium": 32768, "xhigh": 32768}
+
+
+def test_renderer_ladder_names_match_cookbook_family():
+    assert list(models.RENDERER_BY_EFFORT) == ["off", "low", "medium", "xhigh"]
+    assert all(v.startswith("qwen3_8_") for v in models.RENDERER_BY_EFFORT.values())
+
+
+class Status429(Exception):
+    status_code = 429
+
+
+class Status401(Exception):
+    status_code = 401
+
+
+class ServerCategory(Exception):
+    """Shaped like tinker.RequestFailedError."""
+    def __init__(self):
+        super().__init__("request failed")
+        self.category = type("Cat", (), {"name": "SERVER"})()
+
+
+@pytest.mark.parametrize("exc,transient", [
+    (Status429("x"), True),
+    (Status401("Invalid API key (request id 4291)"), False),          # status wins; 4291 is not 429
+    (RuntimeError("Invalid API key (request id 4291)"), False),      # word-bounded code match
+    (RuntimeError("HTTP 429 Too Many Requests"), True),
+    (RuntimeError("Read timed out"), True),
+    (TimeoutError(), True),
+    (ConnectionError("reset"), True),
+    (ServerCategory(), True),
+    (ValueError("renderer misconfigured"), False),
+    (RuntimeError("the project is read-only and cannot be modified"), False),
+])
+def test_transient_classification(exc, transient):
+    assert models._is_transient(exc) is transient
+
+
+def test_retries_zero_still_makes_one_attempt():
+    m = make_model(FakeRenderer([{"type": "text", "text": "ok"}]), FakeSampler([1], "stop"), retries=0)
+    assert asyncio.run(m.complete(MSGS))[0] == "ok"
+
+
+def test_hung_call_hits_the_deadline_and_is_retried(monkeypatch):
+    async def fake_sleep(s):
+        pass
+
+    monkeypatch.setattr(models.asyncio, "sleep", fake_sleep)
+
+    class HangOnce(FakeSampler):
+        def __init__(self):
+            super().__init__([1, 2], "stop")
+            self.hung = False
+
+        async def sample_async(self, prompt, num_samples, sampling_params):
+            if not self.hung:
+                self.hung = True
+                self.calls.append("hang")
+                await asyncio.Event().wait()          # never completes; only the deadline can end it
+            return await super().sample_async(prompt, num_samples, sampling_params)
+
+    sampler = HangOnce()
+    m = make_model(FakeRenderer([{"type": "text", "text": "ok"}]), sampler, retries=3)
+    m.call_timeout = 0.05
+    text, _, _ = asyncio.run(m.complete(MSGS))
+    assert text == "ok" and sampler.calls[0] == "hang" and m.last_info["attempts"] == 2
+
+
+class TaggedRenderer(FakeRenderer):
+    """One renderer per effort whose prompt carries its tag, so the sampler can truncate per effort."""
+
+    def __init__(self, tag):
+        super().__init__([{"type": "text", "text": f"ok@{tag}"}])
+        self.tag = tag
+
+    def build_generation_prompt(self, messages):
+        return SimpleNamespace(length=100, effort=self.tag)
+
+
+class LadderSampler(FakeSampler):
+    """Cuts the reply off at max_tokens for the efforts in `truncate_for`, answers cleanly otherwise."""
+
+    def __init__(self, truncate_for):
+        super().__init__([1, 2, 3], "stop")
+        self.truncate_for, self.efforts = set(truncate_for), []
+
+    async def sample_async(self, prompt, num_samples, sampling_params):
+        self.efforts.append(prompt.effort)
+        if prompt.effort in self.truncate_for:
+            return SimpleNamespace(sequences=[SimpleNamespace(tokens=[1] * sampling_params.max_tokens, stop_reason="length")])
+        return SimpleNamespace(sequences=[SimpleNamespace(tokens=[1, 2, 3], stop_reason="stop")])
+
+
+def ladder_model(sampler, reasoning):
+    m = make_model(FakeRenderer([]), sampler, reasoning=reasoning)
+    m._renderers = {e: TaggedRenderer(e) for e in models.EFFORTS}
+    return m
+
+
+def test_truncation_steps_down_the_thinking_ladder():
+    sampler = LadderSampler(truncate_for={"xhigh", "medium"})
+    m = ladder_model(sampler, "xhigh")
+    text, _, n_out = asyncio.run(m.complete(MSGS))
+    assert text == "ok@low" and sampler.efforts == ["xhigh", "medium", "low"]
+    assert m.last_info["effort"] == "low" and m.last_info["stepped_down_from"] == "xhigh > medium"
+    assert m.last_info["parse_error"] is None
+    assert n_out == 2 * models.DEFAULT_MAX_TOKENS["xhigh"] + 3      # the trace bills every attempt
+
+
+def test_step_down_stops_after_off_and_still_reports_the_truncation():
+    sampler = LadderSampler(truncate_for=set(models.EFFORTS))
+    m = ladder_model(sampler, "low")
+    text, _, _ = asyncio.run(m.complete(MSGS))
+    assert text == "" and sampler.efforts == ["low", "off"]
+    assert "truncated" in m.last_info["parse_error"] and m.last_info["stepped_down_from"] == "low"
+
+
+def test_step_down_can_be_disabled_and_never_applies_to_a_prebuilt_renderer():
+    sampler = LadderSampler(truncate_for={"low"})
+    m = ladder_model(sampler, "low")
+    m.step_down = False
+    assert asyncio.run(m.complete(MSGS))[0] == "" and sampler.efforts == ["low"]
+    params = SimpleNamespace(max_tokens=50, temperature=0)
+    prebuilt = models.TinkerModel(FakeSampler([1] * 50, "length"), FakeRenderer([{"type": "text", "text": "x"}]), params, "n")
+    assert asyncio.run(prebuilt.complete(MSGS))[0] == "" and "stepped_down_from" not in prebuilt.last_info
+
+
+def test_ladder_order_and_renderer_lookup_match_the_yaml():
+    assert models.EFFORT_BY_RENDERER["qwen3_8_low_reasoning"] == "low"
+    assert [models.next_lower_effort(e) for e in ("xhigh", "medium", "low", "off", "default", None)] == \
+           ["medium", "low", "off", None, None, None]
