@@ -6,3 +6,8 @@ results.json
 __pycache__/
 .env
 .venv/
+
+# external dataset downloads and derived training data (large / reproducible via scripts)
+datasets/raw/
+datasets/processed/*
+!datasets/processed/.gitkeep
