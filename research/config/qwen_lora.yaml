@@ -1,0 +1,11 @@
+# Initial supervised-LoRA experiment for the local spreadsheet agent.
+# `train_lora.py --dry-run` reads this safely without creating a Tinker session.
+base_model: Qwen/Qwen3.8-27B
+project_id: 14017256-055e-4590-a166-c4d55c6154a6
+renderer: qwen3_8_medium_reasoning
+rank: 16
+learning_rate: 0.0001
+epochs: 2
+batch_size: 4
+max_length: 32768
+seed: 20260905
