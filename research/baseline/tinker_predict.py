@@ -73,13 +73,14 @@ async def main():
     if not base_model:
         raise ValueError("base_model must be set in the YAML config or passed as --base-model")
     project_id = args.project_id or config.get("project_id")
+    model_path = args.model_path or config.get("model_path") or None
     concurrency = args.concurrency if args.concurrency is not None else config.get("concurrency", 4)
     max_tokens = args.max_tokens if args.max_tokens is not None else config.get("max_tokens", 8192)
     temperature = args.temperature if args.temperature is not None else config.get("temperature", 0)
     renderer_name = config.get("renderer") or default_renderer(base_model)
     print(f"Tinker project ID: {project_id or '<default project>'}", flush=True)
     sampler = tinker.ServiceClient(project_id=project_id).create_sampling_client(
-        base_model=base_model, model_path=args.model_path
+        base_model=base_model, model_path=model_path
     )
     renderer = renderers.get_renderer(renderer_name, get_tokenizer(base_model))
     params = types.SamplingParams(max_tokens=max_tokens, temperature=temperature, stop=renderer.get_stop_sequences())
@@ -122,7 +123,7 @@ async def main():
                            f"({' -> '.join(name for name, _ in ladder)}): raise max_tokens")
 
     tasks = selected_tasks(Path(args.dataset_dir), parse_ids(args.ids))
-    await run(complete, args.model_path or base_model, tasks, Path(args.out_dir), concurrency)
+    await run(complete, model_path or base_model, tasks, Path(args.out_dir), concurrency)
 
 
 if __name__ == "__main__":

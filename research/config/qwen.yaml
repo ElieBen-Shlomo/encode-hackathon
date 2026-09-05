@@ -1,6 +1,7 @@
 # Default settings for Qwen inference through Tinker.
 # Command-line flags override these values, e.g. --max-tokens 32768.
 base_model: Qwen/Qwen3.8-27B
+model_path: null                     # tinker://... sampler checkpoint of the fine-tune; null samples the base model (or pass --model-path)
 project_id: 14017256-055e-4590-a166-c4d55c6154a6
 renderer: qwen3_8_low_reasoning      # dev-100: low = medium = adaptive (65/64/64), fastest; xhigh truncates at any cap
 concurrency: 400

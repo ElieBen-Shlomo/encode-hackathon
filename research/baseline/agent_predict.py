@@ -58,6 +58,7 @@ async def main() -> None:
     if not base_model:
         raise ValueError("base_model must be set in the YAML config or passed as --base-model")
     project_id = args.project_id or config.get("project_id")
+    model_path = args.model_path or config.get("model_path") or None
     concurrency = args.concurrency if args.concurrency is not None else config.get("concurrency", 4)
     max_tokens = args.max_tokens if args.max_tokens is not None else config.get("max_tokens", 8192)
     temperature = args.temperature if args.temperature is not None else config.get("temperature", 0)
@@ -74,7 +75,7 @@ async def main() -> None:
 
     print(f"Tinker project ID: {project_id or '<default project>'}", flush=True)
     sampler = tinker.ServiceClient(project_id=project_id).create_sampling_client(
-        base_model=base_model, model_path=args.model_path
+        base_model=base_model, model_path=model_path
     )
     renderer = renderers.get_renderer(renderer_name, get_tokenizer(base_model))
     params = types.SamplingParams(max_tokens=max_tokens, temperature=temperature, stop=renderer.get_stop_sequences())
@@ -88,17 +89,17 @@ async def main() -> None:
     tasks = selected_tasks(Path(args.dataset_dir), parse_ids(args.ids))
     out_dir = Path(args.out_dir)
     prepare_out_dir(out_dir)
-    log(out_dir, f"mode agent  model {args.model_path or base_model}  tasks {len(tasks)}  digest {digest}  max_turns {max_turns} "
+    log(out_dir, f"mode agent  model {model_path or base_model}  tasks {len(tasks)}  digest {digest}  max_turns {max_turns} "
                  f"review {review_after_edit} recalc {auto_recalculate} verify {verify_changes} critic {critic_enabled}")
     retries = int(config.get("retries", 6))
     call_timeout = config.get("call_timeout", 900) or None
-    name = args.model_path or base_model
+    name = model_path or base_model
     effort = EFFORT_BY_RENDERER.get(renderer_name)
     fallback = config.get("fallback_renderers", "auto")
     ladder = effort is not None and bool(fallback) and str(fallback).lower() not in ("none", "off", "false")
     if ladder:
         # one renderer per thinking level, so a reply cut off by max_tokens is retried one level lower
-        model = TinkerModel(sampler, name=name, base_model=base_model, model_path=args.model_path, reasoning=effort,
+        model = TinkerModel(sampler, name=name, base_model=base_model, model_path=model_path, reasoning=effort,
                             max_tokens=max_tokens, temperature=temperature, retries=retries, call_timeout=call_timeout)
     else:
         model = TinkerModel(sampler, renderer, params, name, retries=retries, call_timeout=call_timeout)
@@ -107,7 +108,7 @@ async def main() -> None:
     if critic_enabled:
         critic_params = types.SamplingParams(max_tokens=critic_max_tokens, temperature=temperature,
                                              stop=renderer.get_stop_sequences())
-        critic = TinkerModel(sampler, renderer, critic_params, f"{args.model_path or base_model}:critic", retries=retries, call_timeout=call_timeout)
+        critic = TinkerModel(sampler, renderer, critic_params, f"{model_path or base_model}:critic", retries=retries, call_timeout=call_timeout)
     semaphore = asyncio.Semaphore(concurrency)
 
     async def run_one(task: dict) -> None:

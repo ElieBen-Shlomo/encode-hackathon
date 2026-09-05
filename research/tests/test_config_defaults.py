@@ -45,6 +45,14 @@ def test_yaml_matches_the_study():
     assert cfg["digest"] == "grid" and cfg["temperature"] == 0
     assert cfg["concurrency"] == 400 and cfg["retries"] == 6 and cfg["call_timeout"] == 900
     assert set(cfg) >= {"libreoffice_concurrency", "sandbox_concurrency", "reads_concurrency"}
+    assert "model_path" in cfg and cfg["model_path"] is None      # the fine-tune is switched on here (tinker://...)
+
+
+def test_lora_trains_with_the_renderer_inference_serves():
+    """A checkpoint must be served with the renderer it was trained with; the two yamls have to agree."""
+    infer = yaml.safe_load((RESEARCH / "config" / "qwen.yaml").read_text())
+    train = yaml.safe_load((RESEARCH / "config" / "qwen_lora.yaml").read_text())
+    assert train["renderer"] == infer["renderer"] and train["base_model"] == infer["base_model"]
 
 
 def test_docker_image_installs_the_tinker_backend():
