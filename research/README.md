@@ -85,6 +85,20 @@ uv run evaluate.py --predictions submissions/my-llm/predictions.jsonl --no-recal
 
 `tinker_predict.py` is the same baseline through [Tinker](https://tinker-docs.thinkingmachines.ai), for a base model or your fine-tuned checkpoint. `uv sync --extra tinker`, put `TINKER_API_KEY` in `.env`, then `--base-model Qwen/Qwen3-8B` and optionally `--model-path tinker://<run-id>/sampler_weights/final`.
 
+### Local Qwen tool agent
+
+`baseline/tinker_predict.py` also supports a local tool-agent mode, configured in `config/qwen.yaml`.
+In `mode: agent`, Qwen can inspect a workbook and run Python, Bash, or LibreOffice recalculation
+against a copied output workbook for up to `max_turns` model turns. It writes the same predictions,
+outputs, traces, and run log as the baseline; every model and tool call is recorded in the task trace.
+
+```sh
+uv run baseline/tinker_predict.py --mode agent --out-dir submissions/qwen-agent --ids 13-1,51-12
+```
+
+This mode executes model-written commands on the local host. It must not read golden workbooks or
+make network/lookup requests; those are prohibited by the benchmark rules.
+
 Reference numbers for one-shot prompting, values not formulas, on all 400: DeepSeek-V3.2 55.8% pass, Qwen3.8-27B 59.0% pass, Gemini 3.7 Flash 68.3% pass.
 
 ## Docker

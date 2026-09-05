@@ -1,47 +1,43 @@
-"""Execute model-written Python in a subprocess. Only ever runs inside our Docker container
-(or locally during development) — the judge's machine sees nothing but /out.
-
-Contract with the model's script: IN_XLSX and OUT_XLSX come as argv[1]/argv[2] and env vars.
-OUT_XLSX is pre-seeded with a copy of IN_XLSX, so the natural move is load OUT, mutate, save.
-"""
+"""Local execution tools for the Qwen agent."""
 
 import os
-import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
-TAIL = 4000  # chars of stdout+stderr kept for the repair prompt
+TAIL = 4000
 
 
-def clean_env(tmp_home: str) -> dict:
-    """Subprocess env without API keys."""
-    env = {k: v for k, v in os.environ.items() if "API_KEY" not in k and "TOKEN" not in k}
-    env["HOME"] = tmp_home
+def _env(in_xlsx: str, out_xlsx: str) -> dict:
+    env = os.environ.copy()
+    env["IN_XLSX"] = str(Path(in_xlsx).resolve())
+    env["OUT_XLSX"] = str(Path(out_xlsx).resolve())
     return env
 
 
-def run_code(code: str, in_xlsx: str, out_xlsx: str, timeout: int = 120) -> tuple[bool, str]:
-    """Run the script, return (ok, combined output tail). OUT_XLSX must exist afterwards."""
-    # absolute: the script runs with cwd set to its own temp dir, so relative paths
-    # from a relative --out-dir would not resolve there
-    in_xlsx, out_xlsx = str(Path(in_xlsx).resolve()), str(Path(out_xlsx).resolve())
-    shutil.copy(in_xlsx, out_xlsx)
-    with tempfile.TemporaryDirectory() as td:
-        script = Path(td) / "transform.py"
-        script.write_text(code, encoding="utf-8")
-        try:
-            p = subprocess.run(
-                [sys.executable, str(script), str(in_xlsx), str(out_xlsx)],
-                env={**clean_env(td), "IN_XLSX": str(in_xlsx), "OUT_XLSX": str(out_xlsx)},
-                capture_output=True, text=True, timeout=timeout, cwd=td,
-            )
-        except subprocess.TimeoutExpired:
-            return False, f"TIMEOUT: script exceeded {timeout}s"
-        output = (p.stdout + p.stderr)[-TAIL:]
-        if p.returncode != 0:
-            return False, output
-        if not Path(out_xlsx).exists():
-            return False, output + "\nERROR: script deleted OUT_XLSX"
-        return True, output
+def _run(command: list[str], *, work_dir: Path, in_xlsx: str, out_xlsx: str, timeout: int) -> tuple[bool, str]:
+    try:
+        process = subprocess.run(command, cwd=work_dir, env=_env(in_xlsx, out_xlsx), capture_output=True,
+                                 text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, f"TIMEOUT: command exceeded {timeout}s"
+    output = (process.stdout + process.stderr)[-TAIL:]
+    if process.returncode:
+        return False, output or f"command exited with code {process.returncode}"
+    if not Path(out_xlsx).exists():
+        return False, output + "\nERROR: command deleted OUT_XLSX"
+    return True, output or "command completed successfully"
+
+
+def run_python(code: str, *, work_dir: Path, in_xlsx: str, out_xlsx: str, turn: int, timeout: int) -> tuple[bool, str]:
+    """Write and execute one model-generated Python script in the task workspace."""
+    script = work_dir / f"turn_{turn:02d}.py"
+    script.write_text(code, encoding="utf-8")
+    return _run([sys.executable, str(script), str(in_xlsx), str(out_xlsx)], work_dir=work_dir,
+                in_xlsx=in_xlsx, out_xlsx=out_xlsx, timeout=timeout)
+
+
+def run_bash(command: str, *, work_dir: Path, in_xlsx: str, out_xlsx: str, timeout: int) -> tuple[bool, str]:
+    """Execute one model-generated Bash command in the persistent task workspace."""
+    return _run(["/bin/bash", "-lc", command], work_dir=work_dir, in_xlsx=in_xlsx,
+                out_xlsx=out_xlsx, timeout=timeout)
