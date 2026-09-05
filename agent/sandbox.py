@@ -7,9 +7,13 @@ from pathlib import Path
 
 TAIL = 4000
 
+# Model-written code must not see host secrets (TINKER_API_KEY, OPENROUTER_API_KEY, ...):
+# a stray `env` would put them in tool output, which lands in committed traces.
+KEEP_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
+
 
 def _env(in_xlsx: str, out_xlsx: str) -> dict:
-    env = os.environ.copy()
+    env = {key: os.environ[key] for key in KEEP_ENV if key in os.environ}
     env["IN_XLSX"] = str(Path(in_xlsx).resolve())
     env["OUT_XLSX"] = str(Path(out_xlsx).resolve())
     return env
@@ -38,6 +42,9 @@ def run_python(code: str, *, work_dir: Path, in_xlsx: str, out_xlsx: str, turn: 
 
 
 def run_bash(command: str, *, work_dir: Path, in_xlsx: str, out_xlsx: str, timeout: int) -> tuple[bool, str]:
-    """Execute one model-generated Bash command in the persistent task workspace."""
-    return _run(["/bin/bash", "-lc", command], work_dir=work_dir, in_xlsx=in_xlsx,
+    """Execute one model-generated Bash command in the persistent task workspace.
+
+    Non-login shell: profiles would re-source the host environment and clobber the curated PATH.
+    """
+    return _run(["/bin/bash", "-c", command], work_dir=work_dir, in_xlsx=in_xlsx,
                 out_xlsx=out_xlsx, timeout=timeout)

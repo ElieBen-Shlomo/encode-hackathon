@@ -33,5 +33,8 @@ COPY agent/ agent/
 ENV PATH="/app/.venv/bin:$PATH"
 
 # defaults inside run.py: --dataset-dir /data --out-dir /out
-# extra flags can be appended: docker run ... team --ids 13-1,51-12 --mode null
+# Judges run the container with no arguments (SUBMISSION.md), so CMD must be the real
+# pipeline — run.py alone defaults to null mode. Appended flags replace CMD entirely:
+#   docker run ... team --ids 13-1,51-12 --mode null
 ENTRYPOINT ["python", "agent/run.py"]
+CMD ["--mode", "agent", "--model", "deepseek/deepseek-v3.2"]
