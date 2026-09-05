@@ -1,15 +1,21 @@
-"""3-way split of the verified 400 into train / dev / held-out.
+"""Split the verified 400 into train + a held-out INSTRUMENT.
 
-- stratified by instruction_type (275 Cell-Level / 125 Sheet-Level -> same mix in each split)
-- blocked by base-id: tasks sharing a base id (e.g. 82-1, 82-2) stay in the SAME split,
-  so a near-variant can't sit in train while its sibling is in held-out
-- seeded, so the whole team gets the identical split (shared held-out = no leakage)
+The evaluate.py --all number is only a required artifact — the judges rank on their own
+hidden data — so we don't keep the 400 pristine for reporting. We hold a slice out for
+ONE reason: an honest internal signal to tell whether a fine-tune/harness change actually
+helped (and to give AutoResearch a target). That signal must be trustworthy, so it comes
+from the human-verified 400, not the unvetted extras.
 
-Also writes eval_base_ids.txt = base ids used in dev+held-out, so the extra-912 training
-pool can drop any sibling that shares a base id with an eval task.
+  - train_400    : fine-tune on these (verified, trustworthy) + gated-512 + synthetic
+  - heldout_400  : our instrument — touch rarely, use to pick the best model/harness
+  - heldout_base_ids.txt : base ids in held-out, so gated-512 / synthetic can drop any
+                           sibling that shares a base id (no leakage into the instrument)
 
-    python3 datasets/scripts/make_split.py                 # defaults: 0.50/0.25/0.25, seed 0
-    python3 datasets/scripts/make_split.py --dev 0.2 --heldout 0.2 --seed 0
+Base-id-blocked (82-1, 82-2 stay together) and stratified by instruction_type, seeded so
+the whole team shares the identical held-out.
+
+    python3 datasets/scripts/make_split.py                 # default 0.70/0.30, seed 0
+    python3 datasets/scripts/make_split.py --heldout 0.25 --seed 0
 """
 
 import argparse
@@ -27,13 +33,11 @@ def base_id(task_id: str) -> str:
     return task_id.split("-")[0]
 
 
-def make_split(train: float, dev: float, heldout: float, seed: int) -> dict[str, list[str]]:
+def make_split(heldout: float, seed: int) -> dict[str, list[str]]:
     tasks = json.loads(D400.read_text())
-    fracs = {"train": train, "dev": dev, "heldout": heldout}
     rng = random.Random(seed)
-    out = {s: [] for s in fracs}
+    out = {"train_400": [], "heldout_400": []}
 
-    # stratify by type; within a type, keep base-id groups intact
     by_type = collections.defaultdict(list)
     for t in tasks:
         by_type[t["instruction_type"]].append(str(t["id"]))
@@ -43,38 +47,37 @@ def make_split(train: float, dev: float, heldout: float, seed: int) -> dict[str,
             groups[base_id(i)].append(i)
         glist = list(groups.values())
         rng.shuffle(glist)
-        total = len(ids)
-        target = {s: fracs[s] * total for s in fracs}
-        assigned = {s: 0 for s in fracs}
-        for g in glist:  # give each group to the split with the largest remaining deficit
-            s = max(fracs, key=lambda s: target[s] - assigned[s])
-            out[s].extend(g)
-            assigned[s] += len(g)
-    return {s: sorted(v) for s, v in out.items()}
+        target_heldout = heldout * len(ids)
+        n_heldout = 0
+        for g in glist:  # fill held-out to target, keeping base-id groups intact
+            if n_heldout < target_heldout:
+                out["heldout_400"].extend(g)
+                n_heldout += len(g)
+            else:
+                out["train_400"].extend(g)
+    return {k: sorted(v) for k, v in out.items()}
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--train", type=float, default=0.50)
-    p.add_argument("--dev", type=float, default=0.25)
-    p.add_argument("--heldout", type=float, default=0.25)
+    p.add_argument("--heldout", type=float, default=0.30)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
-    split = make_split(args.train, args.dev, args.heldout, args.seed)
+    split = make_split(args.heldout, args.seed)
     SPLITS.mkdir(parents=True, exist_ok=True)
     for name, ids in split.items():
         (SPLITS / f"{name}.txt").write_text("\n".join(ids) + "\n")
+    heldout_bases = sorted({base_id(i) for i in split["heldout_400"]})
+    (SPLITS / "heldout_base_ids.txt").write_text("\n".join(heldout_bases) + "\n")
 
-    eval_bases = sorted({base_id(i) for i in split["dev"] + split["heldout"]})
-    (SPLITS / "eval_base_ids.txt").write_text("\n".join(eval_bases) + "\n")
-
-    types = {t["id"]: t["instruction_type"] for t in map(lambda x: {"id": str(x["id"]), **x}, json.loads(D400.read_text()))}
-    print(f"seed={args.seed} fractions train/dev/heldout = {args.train}/{args.dev}/{args.heldout}")
+    types = {str(t["id"]): t["instruction_type"] for t in json.loads(D400.read_text())}
+    print(f"seed={args.seed} heldout_frac={args.heldout}")
     for name, ids in split.items():
         by = collections.Counter(types[i] for i in ids)
-        print(f"  {name:8} {len(ids):3}  Cell={by['Cell-Level Manipulation']:3}  Sheet={by['Sheet-Level Manipulation']:3}")
-    print(f"wrote {', '.join(f'{s}.txt' for s in split)} + eval_base_ids.txt to datasets/splits/")
+        print(f"  {name:12} {len(ids):3}  Cell={by['Cell-Level Manipulation']:3}  Sheet={by['Sheet-Level Manipulation']:3}")
+    print("wrote train_400.txt, heldout_400.txt, heldout_base_ids.txt to datasets/splits/")
+    print("next: gated-512 + synthetic feed train_400; AutoResearch dev drawn from gated extras")
 
 
 if __name__ == "__main__":
