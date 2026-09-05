@@ -1,51 +1,49 @@
 # DATA PLAN — read before touching training/eval data
 
-Single source of truth for what data is used for what. Splits are committed in
-`datasets/splits/` (seed 0, shared — do not re-split).
+**Scope: we are using ONLY the verified 400 right now.** The full 912 extras and synthetic
+data are deferred — ignore them for now.
 
 ## The split (verified 400)
 
-| File | Count | Use |
+The 400 is split **two ways**, seeded and shared so everyone uses the identical split:
+
+| Split | Count | Use it for |
 |---|---|---|
-| `train_400.txt` | 279 (192 Cell / 87 Sheet) | **TRAINING** |
-| `heldout_400.txt` | 121 (83 Cell / 38 Sheet) | **TEST — our instrument** (never train/tune on it) |
+| **train** | 279 (192 Cell / 87 Sheet) | fine-tune Qwen · generate teacher scripts · debug / error-analysis |
+| **test** | 121 (83 Cell / 38 Sheet) | measure ONLY — baseline, fine-tuned, harness changes. **Never train or tune on it.** |
 
-## What to use for what
+- **Source of truth:** `datasets/splits/train.txt` and `datasets/splits/test.txt`
+  (seed 0, stratified by instruction_type, base-id-blocked so variants like `82-1`/`82-2` stay together).
+- **Browsable folders:** run `python datasets/scripts/organize.py` to get
+  `datasets/400/train/<id>/` and `datasets/400/test/<id>/` (symlinks to the real files).
 
-| Purpose | Data | Notes |
+## When to use what
+
+| If you're… | Use | Never touch |
 |---|---|---|
-| **Train** (fine-tune Qwen) | `train_400` + gated-512 + synthetic | every example verified by the real scorer |
-| **Dev** (iterate / AutoResearch) | a slice of gated-512 | drawn from extras, **not** the 400 → keeps held-out clean |
-| **Test** (honest signal) | `heldout_400` | touch rarely; pick the best model/harness here |
-| **Required artifact** | `evaluate.py --all` on the 400 | contaminated (279 trained) — **declare it**; not ranked (judges use hidden data) |
-
-- **gated-512** = the 512 extras (`extra_912_ids.txt`), keep a task only if **one script passes all 3 instances** (3-for-3), minus any base-id sibling of a held-out task.
-- **synthetic** = execution-verified only. Amount / generator = TBD (open decision below).
+| fine-tuning Qwen | `train` | `test` |
+| generating teacher scripts (SFT data) | `train` | `test` |
+| measuring baseline / fine-tuned / a harness change | `test` | — |
+| debugging, reading failures, error-analysis | `train` | `test` |
 
 ## Rules (non-negotiable)
 
-1. `heldout_400` is **sealed** — never train on it, never let AutoResearch tune against it.
-2. **Never trust an unverified label** — every training script must pass the real scorer
-   (`train_400`: verified golden · extras: 3-for-3 · synthetic: execution-verified).
-3. **Everyone uses the committed splits** (seed 0). Don't regenerate them.
-4. **Drop base-id siblings of held-out** from all training (`heldout_base_ids.txt`).
+1. **`test` is sealed** — never train on it, never tune the harness against it. It's your only honest number.
+2. **Everyone uses the committed split** (seed 0). Don't regenerate it.
+3. **Never trust an unverified label** — a teacher script is kept only if it reproduces the golden (via the real scorer, LibreOffice recalc + compare).
 
-## Pipeline
+## Pipeline (400-only)
 
-`fetch → dedup → make_split → build_sft (teacher blind-solve + 3-for-3 gate) → fine-tune Qwen (Tinker) → eval on heldout_400`
+1. **Baseline** — run Qwen through the harness on `test`, score. *(Needs the Tinker backend in the harness — `feat/tinker-agent-backend`.)*
+2. **Fine-tune** — teacher writes scripts on `train` → keep only scorer-passing ones → fine-tune Qwen → re-score on `test`.
+3. **Improve** — batch the failures from the traces, fix the general error modes in the harness (prompt / repair / digest).
 
-- `build_sft.py` produces `datasets/processed/sft/<name>/sft.jsonl`.
-- Final model = **Qwen on Tinker**. The teacher is an *offline* data-gen step (can be any model).
+## Deferred (not now)
 
-## OPEN DECISIONS — lock these now
+- **The 512 extra tasks (912 − 400) and synthetic data** — more training volume, revisit later.
+- **AutoResearch** — dropped. Harness tuning is manual error-analysis from the traces, not an autonomous loop.
 
-1. **Teacher for data gen** — Opus (Anthropic API, strongest, if the rules allow a non-Tinker model for *data prep*) vs strongest Tinker model (`Qwen/Qwen3.5-397B-A17B` / `deepseek-ai/DeepSeek-V3.1`). Final model is Qwen either way.
-2. **Synthetic** — how much, what generator, finance-flavored vs general. Not built yet.
-3. **Split sizes** — currently 279/121 (70/30). Confirm or change `--heldout`.
+## Ownership
 
-## Ownership (4 people, 2 groups — suggested)
-
-- **Group A — harness + AutoResearch**: `agent/` harness, digest, DQ guard; AutoResearch vs the gated-extras dev set.
-- **Group B — data + fine-tune**: run `build_sft`, build synthetic, Tinker fine-tune, own the checkpoints.
-
-Sync points: shared split (this doc), the harness I/O contract, and the checkpoint handoff.
+- **Group A** — harness + error-analysis (prompt, digest, repair loop, failure batching).
+- **Group B** — teacher data-gen (`train`) + Tinker fine-tune + checkpoints.
