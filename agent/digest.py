@@ -8,7 +8,7 @@ import openpyxl
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import range_boundaries
 
-from sb import answer_ranges
+from sb import answer_ranges, parse_answer_position
 
 HEAD_ROWS = 30
 WINDOW = 8         # rows around the answer range
@@ -72,3 +72,52 @@ def digest(path: str, task: dict) -> str:
             body.append(f"... rows {prev + 1}-{n_rows} omitted ({n_rows - prev} rows) ...")
         parts.append("\n".join([title, header] + body))
     return "\n\n".join(parts)
+
+
+def _cell_description(cell) -> str:
+    value = cell.value
+    if value is None:
+        rendered = "<empty>"
+    elif isinstance(value, str) and value.startswith("="):
+        rendered = f"formula {value!r}"
+    else:
+        rendered = repr(value)
+    return f"{cell.coordinate}={rendered} [{type(value).__name__}]"
+
+
+def _sample_range(ws, cell_range: str, limit: int) -> list[str]:
+    min_col, min_row, max_col, max_row = range_boundaries(cell_range)
+    min_row = min_row or 1
+    max_row = max_row or ws.max_row
+    coordinates = [(row, col) for row in range(min_row, max_row + 1) for col in range(min_col, max_col + 1)]
+    omitted = len(coordinates) > limit
+    if omitted:
+        head = max(1, limit // 2)
+        coordinates = coordinates[:head] + coordinates[-(limit - head):]
+    lines = [_cell_description(ws.cell(row=row, column=col)) for row, col in coordinates]
+    if omitted:
+        lines.insert(max(1, limit // 2), "... cells omitted ...")
+    return lines
+
+
+def verification_snapshot(path: str, task: dict, *, answer_limit: int = 100, source_limit: int = 80) -> str:
+    """Small, type-aware answer/source view for the review and critic phases."""
+    wb = openpyxl.load_workbook(path, data_only=False)
+    parts = ["## Graded answer cells (current workbook)"]
+    for sheet, cell_range in answer_ranges(task):
+        if sheet not in wb.sheetnames:
+            parts.append(f"{sheet!r}!{cell_range}: SHEET MISSING")
+            continue
+        parts.append(f"### {sheet!r}!{cell_range}")
+        parts.extend(_sample_range(wb[sheet], cell_range, answer_limit))
+
+    if data_range := task.get("data_position"):
+        parts.append("\n## Relevant declared source cells")
+        for sheet, cell_range in parse_answer_position(data_range):
+            sheet = sheet or task.get("answer_sheet")
+            if sheet not in wb.sheetnames:
+                parts.append(f"{sheet!r}!{cell_range}: SHEET MISSING")
+                continue
+            parts.append(f"### {sheet!r}!{cell_range}")
+            parts.extend(_sample_range(wb[sheet], cell_range, source_limit))
+    return "\n".join(parts)
