@@ -53,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lo-concurrency", type=int, default=None, help="simultaneous LibreOffice recalculations (default: CPU count)")
     p.add_argument("--sandbox-concurrency", type=int, default=None, help="simultaneous Python/Bash tool processes (default: 2x CPU count)")
     p.add_argument("--retries", type=int, default=6, help="attempts per model call on throttling or transient errors")
+    p.add_argument("--call-timeout", type=float, default=900.0, help="seconds allowed per model call attempt (0 = no deadline)")
     p.add_argument("--mode", choices=["agent", "values", "null"], default="agent")
     p.add_argument("--model", default="tinker", help='"tinker", "tinker:<base>", "mock", or an OpenRouter model id')
     p.add_argument("--base-model", default=DEFAULT_BASE_MODEL, help="Tinker base model")
@@ -131,7 +132,8 @@ async def run_model(tasks: list[dict], out_dir: Path, args: argparse.Namespace) 
 
     set_local_limits(args.lo_concurrency, args.sandbox_concurrency)
     model = get_model(args.model, base_model=args.base_model, model_path=args.model_path,
-                      project_id=args.project_id, reasoning=args.reasoning, max_tokens=args.max_tokens, retries=args.retries)
+                      project_id=args.project_id, reasoning=args.reasoning, max_tokens=args.max_tokens, retries=args.retries,
+                      call_timeout=args.call_timeout or None)
     cfg = SolveConfig(mode=args.mode, digest=args.digest, budget_tokens=args.budget, reasoning=args.reasoning,
                       max_turns=args.max_turns, tool_timeout=args.tool_timeout)
     semaphore = asyncio.Semaphore(args.concurrency)

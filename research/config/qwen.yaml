@@ -7,6 +7,8 @@ concurrency: 400
 max_tokens: 32768
 temperature: 0
 fallback_renderers: auto
+retries: 6                           # attempts per model call on throttling / transient errors (typed Tinker errors + status codes)
+call_timeout: 900                    # seconds per attempt; bounds a hung call so one task cannot block for hours
 digest: grid                         # workbook view for the agent: formulas -> values, typed headers, names (dev-100: 88% vs 75% windowed)
 libreoffice_concurrency: null        # default CPU count; bounds local recalcs independently of `concurrency`
 sandbox_concurrency: null            # default 2x CPU count

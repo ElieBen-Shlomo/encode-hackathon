@@ -45,6 +45,7 @@ def make_model(renderer, sampler, reasoning="low", max_tokens=None, retries=3):
     m = object.__new__(models.TinkerModel)
     m.base_model, m.model_path, m.reasoning, m.max_tokens = "Qwen/Qwen3.8-27B", None, reasoning, max_tokens
     m.name, m.last_info, m.project_id, m._fixed_params, m.retries = "tinker:test", {}, None, None, retries
+    m.call_timeout = None
     m._types = SimpleNamespace(SamplingParams=lambda **kw: SimpleNamespace(**kw))
     m._sampler, m._tokenizer = sampler, SimpleNamespace(decode=lambda toks: "raw")
     m._renderers = {e: renderer for e in models.EFFORTS}
@@ -170,3 +171,64 @@ def test_default_caps_are_32k_with_thinking_and_8k_without():
 def test_renderer_ladder_names_match_cookbook_family():
     assert list(models.RENDERER_BY_EFFORT) == ["off", "low", "medium", "xhigh"]
     assert all(v.startswith("qwen3_8_") for v in models.RENDERER_BY_EFFORT.values())
+
+
+class Status429(Exception):
+    status_code = 429
+
+
+class Status401(Exception):
+    status_code = 401
+
+
+class ServerCategory(Exception):
+    """Shaped like tinker.RequestFailedError."""
+    def __init__(self):
+        super().__init__("request failed")
+        self.category = type("Cat", (), {"name": "SERVER"})()
+
+
+@pytest.mark.parametrize("exc,transient", [
+    (Status429("x"), True),
+    (Status401("Invalid API key (request id 4291)"), False),          # status wins; 4291 is not 429
+    (RuntimeError("Invalid API key (request id 4291)"), False),      # word-bounded code match
+    (RuntimeError("HTTP 429 Too Many Requests"), True),
+    (RuntimeError("Read timed out"), True),
+    (TimeoutError(), True),
+    (ConnectionError("reset"), True),
+    (ServerCategory(), True),
+    (ValueError("renderer misconfigured"), False),
+    (RuntimeError("the project is read-only and cannot be modified"), False),
+])
+def test_transient_classification(exc, transient):
+    assert models._is_transient(exc) is transient
+
+
+def test_retries_zero_still_makes_one_attempt():
+    m = make_model(FakeRenderer([{"type": "text", "text": "ok"}]), FakeSampler([1], "stop"), retries=0)
+    assert asyncio.run(m.complete(MSGS))[0] == "ok"
+
+
+def test_hung_call_hits_the_deadline_and_is_retried(monkeypatch):
+    async def fake_sleep(s):
+        pass
+
+    monkeypatch.setattr(models.asyncio, "sleep", fake_sleep)
+
+    class HangOnce(FakeSampler):
+        def __init__(self):
+            super().__init__([1, 2], "stop")
+            self.hung = False
+
+        async def sample_async(self, prompt, num_samples, sampling_params):
+            if not self.hung:
+                self.hung = True
+                self.calls.append("hang")
+                await asyncio.Event().wait()          # never completes; only the deadline can end it
+            return await super().sample_async(prompt, num_samples, sampling_params)
+
+    sampler = HangOnce()
+    m = make_model(FakeRenderer([{"type": "text", "text": "ok"}]), sampler, retries=3)
+    m.call_timeout = 0.05
+    text, _, _ = asyncio.run(m.complete(MSGS))
+    assert text == "ok" and sampler.calls[0] == "hang" and m.last_info["attempts"] == 2

@@ -34,13 +34,28 @@ RENDERER_BY_EFFORT = {
 EFFORTS = tuple(RENDERER_BY_EFFORT)
 DEFAULT_MAX_TOKENS = {"off": 8192, "low": 32768, "medium": 32768, "xhigh": 32768}  # tokens are cheap; truncation is not
 
-TRANSIENT_MARKERS = ("429", "rate limit", "rate_limit", "too many", "timeout", "timed out", "502", "503", "504",
-                     "overloaded", "temporarily", "unavailable", "connection", "reset by peer", "eof", "capacity")
+# Transient failures worth retrying: Tinker's typed errors first (status codes, connection/timeouts,
+# RequestFailedError categories that blame the server), then a narrow message pattern as a fallback.
+TRANSIENT_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+TRANSIENT_TYPE_NAMES = {"RateLimitError", "InternalServerError", "APIConnectionError", "APITimeoutError",
+                        "TimeoutError", "ConnectionError", "ReadTimeout", "ConnectTimeout", "RemoteProtocolError"}
+_TRANSIENT_RE = re.compile(r"\b(408|429|502|503|504)\b|rate.?limit|too many requests|timed? ?out|temporarily unavailable"
+                           r"|service unavailable|overloaded|connection (reset|error|refused|aborted)|server error", re.I)
 
 
 def _is_transient(exc: Exception) -> bool:
-    text = f"{type(exc).__name__}: {exc}".lower()
-    return any(m in text for m in TRANSIENT_MARKERS)
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status in TRANSIENT_STATUS
+    category = getattr(exc, "category", None)          # tinker.RequestFailedError
+    if category is not None:
+        label = str(getattr(category, "name", category)).lower()
+        return any(k in label for k in ("server", "infra", "transient", "timeout", "unavailable"))
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
+        return True
+    if {c.__name__ for c in type(exc).__mro__} & TRANSIENT_TYPE_NAMES:
+        return True
+    return bool(_TRANSIENT_RE.search(str(exc)))
 
 
 MOCK_VALUES_REPLY = '{"cells": []}'
@@ -93,12 +108,13 @@ class TinkerModel:
     def __init__(self, sampler=None, renderer=None, sampling_params=None, name: str | None = None, *,
                  base_model: str = DEFAULT_BASE_MODEL, model_path: str | None = None,
                  project_id: str | None = None, reasoning: str = "low", max_tokens: int | None = None,
-                 retries: int = 6):
+                 retries: int = 6, call_timeout: float | None = 900.0):
         self.last_info = {}
         self._fixed_params = None
         self._types = None
         self._tokenizer = None
         self.retries = retries
+        self.call_timeout = call_timeout
         if sampler is not None:
             self._sampler = sampler
             self._renderers = {"default": renderer}
@@ -145,13 +161,20 @@ class TinkerModel:
         return eff, renderer, params
 
     async def _sample(self, model_input, params):
-        """One sampling call with exponential backoff on transient failures (throttling, timeouts, 5xx)."""
+        """One sampling call with a per-attempt deadline and exponential backoff on transient failures.
+
+        Tinker's SDK retries and stuck-detects internally (up to hours); the deadline here bounds each attempt
+        so a hung call cannot block a task indefinitely, and the attempt budget bounds the total.
+        """
+        attempts_allowed = max(1, int(self.retries or 1))
         delay = 2.0
-        for attempt in range(1, self.retries + 1):
+        for attempt in range(1, attempts_allowed + 1):
             try:
-                return await self._sampler.sample_async(prompt=model_input, num_samples=1, sampling_params=params), attempt
+                call = self._sampler.sample_async(prompt=model_input, num_samples=1, sampling_params=params)
+                response = await (asyncio.wait_for(call, timeout=self.call_timeout) if self.call_timeout else call)
+                return response, attempt
             except Exception as e:
-                if attempt == self.retries or not _is_transient(e):
+                if attempt == attempts_allowed or not _is_transient(e):
                     raise
                 await asyncio.sleep(min(60.0, delay) + random.uniform(0, 1))
                 delay *= 2
@@ -219,7 +242,8 @@ class OpenRouterModel:
 
 
 def get_model(spec: str, *, base_model: str = DEFAULT_BASE_MODEL, model_path: str | None = None,
-              project_id: str | None = None, reasoning: str = "low", max_tokens: int | None = None, retries: int = 6):
+              project_id: str | None = None, reasoning: str = "low", max_tokens: int | None = None, retries: int = 6,
+              call_timeout: float | None = 900.0):
     if spec == "mock":
         return MockModel()
     if spec == "tinker" or spec.startswith("tinker:"):
@@ -227,5 +251,5 @@ def get_model(spec: str, *, base_model: str = DEFAULT_BASE_MODEL, model_path: st
             base_model, _, path = spec[len("tinker:"):].partition("@")
             model_path = path or model_path
         return TinkerModel(base_model=base_model, model_path=model_path, project_id=project_id,
-                           reasoning=reasoning, max_tokens=max_tokens, retries=retries)
+                           reasoning=reasoning, max_tokens=max_tokens, retries=retries, call_timeout=call_timeout)
     return OpenRouterModel(spec)

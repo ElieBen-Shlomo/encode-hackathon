@@ -33,7 +33,7 @@ def test_yaml_matches_the_study():
     assert cfg["renderer"] == "qwen3_8_low_reasoning"
     assert cfg["max_tokens"] == 32768 and cfg["fallback_renderers"] == "auto"
     assert cfg["digest"] == "grid" and cfg["temperature"] == 0
-    assert cfg["concurrency"] == 400
+    assert cfg["concurrency"] == 400 and cfg["retries"] == 6 and cfg["call_timeout"] == 900
 
 
 def test_local_limits_are_separate_from_api_concurrency():

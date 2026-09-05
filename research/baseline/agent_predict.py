@@ -90,12 +90,14 @@ async def main() -> None:
     prepare_out_dir(out_dir)
     log(out_dir, f"mode agent  model {args.model_path or base_model}  tasks {len(tasks)}  digest {digest}  max_turns {max_turns} "
                  f"review {review_after_edit} recalc {auto_recalculate} verify {verify_changes} critic {critic_enabled}")
-    model = TinkerModel(sampler, renderer, params, args.model_path or base_model)
+    retries = int(config.get("retries", 6))
+    call_timeout = config.get("call_timeout", 900) or None
+    model = TinkerModel(sampler, renderer, params, args.model_path or base_model, retries=retries, call_timeout=call_timeout)
     critic = None
     if critic_enabled:
         critic_params = types.SamplingParams(max_tokens=critic_max_tokens, temperature=temperature,
                                              stop=renderer.get_stop_sequences())
-        critic = TinkerModel(sampler, renderer, critic_params, f"{args.model_path or base_model}:critic")
+        critic = TinkerModel(sampler, renderer, critic_params, f"{args.model_path or base_model}:critic", retries=retries, call_timeout=call_timeout)
     semaphore = asyncio.Semaphore(concurrency)
 
     async def run_one(task: dict) -> None:
