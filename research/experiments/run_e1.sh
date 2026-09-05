@@ -26,9 +26,9 @@ run() {  # run a list of configs sequentially in one process
 }
 both() {  # run two config lists in parallel, wait for both
   local n=$(( $# / 2 ))
-  run "${@:1:$n}" &
-  run "${@:$(( n + 1 ))}" &
-  wait
+  run "${@:1:$n}" & local p1=$!
+  run "${@:$(( n + 1 ))}" & local p2=$!
+  wait "$p1" "$p2"   # explicit pids: a bare wait also waits for the tee process substitution and hangs forever
 }
 
 echo "== 1. E0: shipped baseline through Tinker (values, tsv, xhigh, 8192 tokens)"
