@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ids", help="comma-separated task ids (default: all)")
     p.add_argument("--base-model", required=True, help="e.g. Qwen/Qwen3-8B")
     p.add_argument("--model-path", help="tinker://... sampler checkpoint. Omit to sample the base model.")
+    p.add_argument("--project-id", help="Tinker project ID for the sampling session (uses Tinker's default project if omitted)")
     p.add_argument("--concurrency", type=int, default=4)
     p.add_argument("--max-tokens", type=int, default=8192, help="sheet-level tasks need long replies")
     return p.parse_args()
@@ -38,7 +39,10 @@ def parse_args() -> argparse.Namespace:
 async def main():
     load_env()
     args = parse_args()
-    sampler = tinker.ServiceClient().create_sampling_client(base_model=args.base_model, model_path=args.model_path)
+    print(f"Tinker project ID: {args.project_id or '<default project>'}", flush=True)
+    sampler = tinker.ServiceClient(project_id=args.project_id).create_sampling_client(
+        base_model=args.base_model, model_path=args.model_path
+    )
     renderer = renderers.get_renderer(get_recommended_renderer_name(args.base_model), get_tokenizer(args.base_model))
     params = types.SamplingParams(max_tokens=args.max_tokens, temperature=0, stop=renderer.get_stop_sequences())
 
