@@ -16,11 +16,12 @@ uv run eval/make_splits.py            # eval/splits/{dev100,check50,rest250}.txt
 ## The configuration the study selected (now the defaults)
 
 Code agent, `grid` view, `low` thinking, 32k completion cap with the step-down ladder, 400 tasks in flight,
-local LibreOffice and sandbox work bounded to the CPU count. dev-100: 88% against 52% for the shipped setup
+local LibreOffice, sandbox and workbook-read work each bounded on its own thread pool (CPU count, 2x, 2x).
+dev-100: 88% against 52% for the shipped setup
 (see `representation_ablation.md`). Both entry points default to it:
 
 ```sh
-uv run agent/run.py --dataset-dir <data> --out-dir <out>      # flags: --digest --reasoning --max-tokens --concurrency --lo-concurrency --sandbox-concurrency --retries
+uv run agent/run.py --dataset-dir <data> --out-dir <out>      # flags: --digest --reasoning --max-tokens --concurrency --lo-concurrency --sandbox-concurrency --reads-concurrency --retries --call-timeout
 uv run baseline/agent_predict.py --out-dir <out>              # reads research/config/qwen.yaml (renderer, digest, concurrency, ...)
 ```
 

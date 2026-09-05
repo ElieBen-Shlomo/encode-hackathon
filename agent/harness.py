@@ -10,12 +10,14 @@ fallback rule (every task ends with an output workbook and a predictions line):
 """
 
 import asyncio
+import functools
 import json
 import os
 import shutil
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -42,29 +44,59 @@ TRACE_TEXT_CAP = 20_000
 
 # Local CPU work is bounded separately from API concurrency: at --concurrency 400 the model calls fly, but
 # 400 simultaneous LibreOffice recalculations or sandbox interpreters would thrash the machine.
-_LIMITS = {"libreoffice": max(2, os.cpu_count() or 4), "sandbox": 2 * max(2, os.cpu_count() or 4)}
-_SEMAPHORES: dict[tuple, asyncio.Semaphore] = {}
+# Each kind runs on its own thread pool sized to its limit, so a burst of 120 s sandbox waits can never fill
+# the loop's shared default executor and starve the cheap in-process reads (inspect_range, diffs, snapshots).
+_CPUS = max(2, os.cpu_count() or 4)
+_LIMITS = {"libreoffice": _CPUS, "sandbox": 2 * _CPUS, "reads": 2 * _CPUS}
+_EXECUTORS: dict[str, ThreadPoolExecutor] = {}
+_GENERATION = 0   # bumped when limits change so semaphores built for old limits are not reused
 
 
-def set_local_limits(libreoffice: int | None = None, sandbox: int | None = None) -> None:
-    if libreoffice:
-        _LIMITS["libreoffice"] = libreoffice
-    if sandbox:
-        _LIMITS["sandbox"] = sandbox
-    _SEMAPHORES.clear()
+def set_local_limits(libreoffice: int | None = None, sandbox: int | None = None, reads: int | None = None) -> None:
+    """Override the per-kind bounds (None keeps the current value; anything below 1 is an error, not a no-op)."""
+    for kind, value in (("libreoffice", libreoffice), ("sandbox", sandbox), ("reads", reads)):
+        if value is None:
+            continue
+        if int(value) < 1:
+            raise ValueError(f"{kind} concurrency must be >= 1, got {value!r}")
+        _LIMITS[kind] = int(value)
+    _reset_pools()
+
+
+def _reset_pools() -> None:
+    global _GENERATION
+    _GENERATION += 1
+    for pool in _EXECUTORS.values():
+        pool.shutdown(wait=False)
+    _EXECUTORS.clear()
+
+
+def _executor(kind: str) -> ThreadPoolExecutor:
+    if kind not in _EXECUTORS:
+        _EXECUTORS[kind] = ThreadPoolExecutor(max_workers=_LIMITS[kind], thread_name_prefix=f"local-{kind}")
+    return _EXECUTORS[kind]
 
 
 def _sem(kind: str) -> asyncio.Semaphore:
-    key = (kind, id(asyncio.get_running_loop()))
-    if key not in _SEMAPHORES:
-        _SEMAPHORES[key] = asyncio.Semaphore(_LIMITS[kind])
-    return _SEMAPHORES[key]
+    # Semaphores live on their loop (they are bound to it once they block), so a finished loop takes them
+    # with it instead of staying pinned in a module-level cache.
+    loop = asyncio.get_running_loop()
+    cache = getattr(loop, "_local_semaphores", None)
+    if cache is None or cache[0] != _GENERATION:
+        cache = loop._local_semaphores = (_GENERATION, {})
+    per_kind = cache[1]
+    if kind not in per_kind:
+        per_kind[kind] = asyncio.Semaphore(_LIMITS[kind])
+    return per_kind[kind]
 
 
 async def bounded(kind: str, fn, *args, **kwargs):
-    """Run blocking local work in a thread, holding the per-kind semaphore."""
+    """Run blocking local work on the pool for `kind` while holding its semaphore: at most the limit run at
+    once, and nothing queues behind another kind's long subprocess waits."""
     async with _sem(kind):
-        return await asyncio.to_thread(fn, *args, **kwargs)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(_executor(kind), functools.partial(fn, *args, **kwargs))
+
 
 AGENT_SYSTEM = """You are an expert spreadsheet engineer operating a local workbook tool agent.
 Solve the user instruction by inspecting and editing the workbook, then finish with a valid output workbook.
@@ -342,12 +374,12 @@ async def solve_agent(model, task: dict, out_dir: Path, cfg: SolveConfig, critic
                 except Exception as exc:
                     ok, result = False, f"{type(exc).__name__}: {exc}"
             elif tool == "inspect_range":
-                ok, result = await asyncio.to_thread(inspect_range, str(run.out_xlsx), args.get("sheet", ""), args.get("range", ""),
+                ok, result = await bounded("reads", inspect_range, str(run.out_xlsx), args.get("sheet", ""), args.get("range", ""),
                                                      styles=bool(args.get("styles", False)))
             elif tool == "assert_sorted":
-                ok, result = await asyncio.to_thread(assert_sorted, str(run.out_xlsx), args.get("sheet", ""), args.get("range", ""), args.get("keys", []))
+                ok, result = await bounded("reads", assert_sorted, str(run.out_xlsx), args.get("sheet", ""), args.get("range", ""), args.get("keys", []))
             elif tool == "assert_blank":
-                ok, result = await asyncio.to_thread(assert_blank, str(run.out_xlsx), args.get("sheet", ""), args.get("range", ""))
+                ok, result = await bounded("reads", assert_blank, str(run.out_xlsx), args.get("sheet", ""), args.get("range", ""))
             elif tool == "run_python" and isinstance(args.get("code"), str):
                 ok, result = await bounded("sandbox", run_python, args["code"], work_dir=work_dir, in_xlsx=task["init_xlsx"],
                                                      out_xlsx=str(run.out_xlsx), turn=turn, timeout=cfg.tool_timeout)
@@ -360,17 +392,17 @@ async def solve_agent(model, task: dict, out_dir: Path, cfg: SolveConfig, critic
                 ok, result = False, f"Unknown tool or invalid args: {tool}"
 
             if ok and is_mutation:
-                formulas = await asyncio.to_thread(formula_cells, str(run.out_xlsx), task)
+                formulas = await bounded("reads", formula_cells, str(run.out_xlsx), task)
                 if formulas and cfg.auto_recalculate_formulas:
                     calc_ok, calc_result = await bounded("libreoffice", recalculate_output, run.out_xlsx, work_dir)
                     result += f"\n\nAutomatic formula recalculation: {calc_result}"
                     ok = ok and calc_ok
-                diff = await asyncio.to_thread(diff_workbooks, str(before_edit), str(run.out_xlsx), task,
+                diff = await bounded("reads", diff_workbooks, str(before_edit), str(run.out_xlsx), task,
                                                args.get("expected_changes") if cfg.verify_changes else None)
-                formulas = await asyncio.to_thread(formula_cells, str(run.out_xlsx), task)
+                formulas = await bounded("reads", formula_cells, str(run.out_xlsx), task)
                 verification = format_verification(diff, formulas)
                 try:
-                    snapshot = await asyncio.to_thread(verification_snapshot, str(run.out_xlsx), task)
+                    snapshot = await bounded("reads", verification_snapshot, str(run.out_xlsx), task)
                 except Exception as exc:
                     snapshot = f"Unable to build verification snapshot: {type(exc).__name__}: {exc}"
                 last_evidence = f"## Last tool output\n{result}\n\n{verification}\n\n{snapshot}"

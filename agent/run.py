@@ -52,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--concurrency", type=int, default=400, help="tasks in flight (API calls); local work is bounded separately")
     p.add_argument("--lo-concurrency", type=int, default=None, help="simultaneous LibreOffice recalculations (default: CPU count)")
     p.add_argument("--sandbox-concurrency", type=int, default=None, help="simultaneous Python/Bash tool processes (default: 2x CPU count)")
+    p.add_argument("--reads-concurrency", type=int, default=None, help="simultaneous in-process workbook reads: inspect_range, diffs (default: 2x CPU count)")
     p.add_argument("--retries", type=int, default=6, help="attempts per model call on throttling or transient errors")
     p.add_argument("--call-timeout", type=float, default=900.0, help="seconds allowed per model call attempt (0 = no deadline)")
     p.add_argument("--mode", choices=["agent", "values", "null"], default="agent")
@@ -130,7 +131,7 @@ async def run_model(tasks: list[dict], out_dir: Path, args: argparse.Namespace) 
     from harness import SolveConfig, set_local_limits, solve_task
     from models import get_model
 
-    set_local_limits(args.lo_concurrency, args.sandbox_concurrency)
+    set_local_limits(args.lo_concurrency, args.sandbox_concurrency, args.reads_concurrency)
     model = get_model(args.model, base_model=args.base_model, model_path=args.model_path,
                       project_id=args.project_id, reasoning=args.reasoning, max_tokens=args.max_tokens, retries=args.retries,
                       call_timeout=args.call_timeout or None)

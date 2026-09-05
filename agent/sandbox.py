@@ -8,6 +8,7 @@ Two safety properties hold for everything run here:
 
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -31,13 +32,32 @@ def _env(in_xlsx: str, out_xlsx: str) -> dict:
     return env
 
 
-def _run(command: list[str], *, work_dir: Path, in_xlsx: str, out_xlsx: str, timeout: int) -> tuple[bool, str]:
+def kill_process_group(process: subprocess.Popen) -> None:
+    """Kill a child started with start_new_session=True together with everything it spawned, then reap it."""
     try:
-        process = subprocess.run(command, cwd=work_dir, env=_env(in_xlsx, out_xlsx), capture_output=True,
-                                 text=True, timeout=timeout)
+        if hasattr(os, "killpg"):
+            os.killpg(process.pid, signal.SIGKILL)
+        else:  # pragma: no cover - Windows has no process groups in this sense
+            process.kill()
+    except ProcessLookupError:
+        pass
+    try:
+        process.communicate(timeout=5)
+    except Exception:
+        pass
+
+
+def _run(command: list[str], *, work_dir: Path, in_xlsx: str, out_xlsx: str, timeout: int) -> tuple[bool, str]:
+    # The child gets its own session/process group, so a timeout kills grandchildren too (a `python -c`
+    # or soffice launched by a bash command) instead of leaving them running outside the sandbox bound.
+    process = subprocess.Popen(command, cwd=work_dir, env=_env(in_xlsx, out_xlsx), stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        kill_process_group(process)
         return False, f"TIMEOUT: command exceeded {timeout}s"
-    output = (process.stdout + process.stderr)[-TAIL:]
+    output = (stdout + stderr)[-TAIL:]
     if process.returncode:
         return False, output or f"command exited with code {process.returncode}"
     if not Path(out_xlsx).exists():

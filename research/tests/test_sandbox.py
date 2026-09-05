@@ -5,6 +5,10 @@ both are asserted below (they are expected failures on main).
 """
 
 import hashlib
+import subprocess
+import sys
+import time
+import uuid
 from pathlib import Path
 
 import openpyxl
@@ -58,6 +62,19 @@ def test_deleting_output_is_a_failure(tasks, init_copy, tmp_path):
     src, out, work = _seed(tasks["12307"], init_copy, tmp_path)
     ok, log = sandbox.run_python("import os, sys; os.remove(sys.argv[2])", work_dir=work, in_xlsx=str(src), out_xlsx=str(out), turn=1, timeout=30)
     assert ok is False and "deleted OUT_XLSX" in log
+
+
+def test_timeout_kills_grandchildren_too(tasks, init_copy, tmp_path):
+    """A bash command that backgrounds a Python child: the timeout must take the whole process group down,
+    or the orphan keeps running outside the sandbox bound."""
+    src, out, work = _seed(tasks["12307"], init_copy, tmp_path)
+    marker = f"sandbox_orphan_{uuid.uuid4().hex}"
+    cmd = f'("{sys.executable}" -c "import time; time.sleep(30)  # {marker}") & wait'
+    ok, log = sandbox.run_bash(cmd, work_dir=work, in_xlsx=str(src), out_xlsx=str(out), timeout=2)
+    assert ok is False and "TIMEOUT" in log
+    time.sleep(0.3)
+    survivors = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True).stdout.split()
+    assert not survivors, f"processes outlived the timeout: {survivors}"
 
 
 def test_run_bash_runs_in_the_workspace(tasks, init_copy, tmp_path):

@@ -1,7 +1,8 @@
 # SpreadsheetBench pipeline container.
 #
 #   docker build -t team .
-#   docker run --rm -e OPENROUTER_API_KEY=... -v <dataset dir>:/data:ro -v <empty dir>:/out team
+#   docker run --rm -e TINKER_API_KEY=... -e TINKER_PROJECT_ID=... -v <dataset dir>:/data:ro -v <empty dir>:/out team
+#   (OPENROUTER_API_KEY instead when --model names an OpenRouter model)
 #
 # Reads /data (dataset.json, spreadsheet/<id>/*init*.xlsx, prompt.txt), writes
 # predictions.jsonl, outputs/, traces/, run.log to /out. Model-written code executes
@@ -23,7 +24,8 @@ WORKDIR /app
 
 # dependencies first, for layer caching
 COPY research/pyproject.toml research/uv.lock ./
-RUN uv sync --frozen --no-dev
+# --extra tinker: the default backend (--model tinker) needs the tinker + tinker-cookbook optional dependencies
+RUN uv sync --frozen --no-dev --extra tinker
 
 # code
 COPY research/sb.py sb.py

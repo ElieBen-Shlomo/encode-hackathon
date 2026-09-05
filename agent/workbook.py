@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import os
+import threading
 import re
 import sys
 import tempfile
@@ -329,6 +330,7 @@ def profile_sheet(ws_f, ws_v, header_row: int) -> list[ColumnProfile]:
 
 _INFO_CACHE: dict[tuple, WorkbookInfo] = {}
 _INFO_CACHE_MAX = 6
+_INFO_LOCK = threading.Lock()   # render threads share the cache: lookups, eviction and insertion must not race
 
 
 def load_info(path: str, recalc: bool = True) -> WorkbookInfo:
@@ -338,13 +340,15 @@ def load_info(path: str, recalc: bool = True) -> WorkbookInfo:
     time, so later ws.cell() accesses widening the openpyxl worksheet do not change what is reported.
     """
     key = (str(path), os.path.getmtime(path), recalc)
-    hit = _INFO_CACHE.get(key)
+    with _INFO_LOCK:
+        hit = _INFO_CACHE.get(key)
     if hit is not None:
         return hit
-    info = _load_info_uncached(path, recalc)
-    if len(_INFO_CACHE) >= _INFO_CACHE_MAX:
-        _INFO_CACHE.pop(next(iter(_INFO_CACHE)))
-    _INFO_CACHE[key] = info
+    info = _load_info_uncached(path, recalc)      # outside the lock so distinct files load in parallel
+    with _INFO_LOCK:
+        while len(_INFO_CACHE) >= _INFO_CACHE_MAX:
+            _INFO_CACHE.pop(next(iter(_INFO_CACHE)), None)
+        _INFO_CACHE[key] = info
     return info
 
 

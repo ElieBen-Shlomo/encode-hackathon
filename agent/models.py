@@ -32,6 +32,14 @@ RENDERER_BY_EFFORT = {
     "xhigh": "qwen3_8_xhigh_reasoning",
 }
 EFFORTS = tuple(RENDERER_BY_EFFORT)
+EFFORT_BY_RENDERER = {v: k for k, v in RENDERER_BY_EFFORT.items()}
+LADDER = ("xhigh", "medium", "low", "off")   # step-down order when a reply is cut off by max_tokens
+
+
+def next_lower_effort(effort: str | None) -> str | None:
+    if effort in LADDER and LADDER.index(effort) + 1 < len(LADDER):
+        return LADDER[LADDER.index(effort) + 1]
+    return None
 DEFAULT_MAX_TOKENS = {"off": 8192, "low": 32768, "medium": 32768, "xhigh": 32768}  # tokens are cheap; truncation is not
 
 # Transient failures worth retrying: Tinker's typed errors first (status codes, connection/timeouts,
@@ -99,23 +107,30 @@ class MockModel:
 class TinkerModel:
     """Sample Qwen (a base model or a tinker:// sampler checkpoint) at temperature 0.
 
-    Two ways to build it:
-      TinkerModel(sampler, renderer, sampling_params, name)          prebuilt, one fixed renderer
+    Three ways to build it:
+      TinkerModel(sampler, renderer, sampling_params, name)          prebuilt, one fixed renderer, no ladder
       TinkerModel(base_model=..., reasoning="medium", max_tokens=..) one renderer per thinking level,
                                                                      so `effort` can vary per call
+      TinkerModel(sampler, base_model=..., reasoning=...)            same, reusing an existing sampling client
+
+    With per-effort renderers a reply cut off by max_tokens is retried one thinking level lower
+    (xhigh > medium > low > off) unless step_down=False; the trace records `stepped_down_from`.
     """
 
     def __init__(self, sampler=None, renderer=None, sampling_params=None, name: str | None = None, *,
                  base_model: str = DEFAULT_BASE_MODEL, model_path: str | None = None,
                  project_id: str | None = None, reasoning: str = "low", max_tokens: int | None = None,
-                 retries: int = 6, call_timeout: float | None = 900.0):
+                 temperature: float = 0, retries: int = 6, call_timeout: float | None = 900.0,
+                 step_down: bool = True):
         self.last_info = {}
         self._fixed_params = None
         self._types = None
         self._tokenizer = None
         self.retries = retries
         self.call_timeout = call_timeout
-        if sampler is not None:
+        self.temperature = temperature
+        self.step_down = step_down
+        if sampler is not None and renderer is not None:
             self._sampler = sampler
             self._renderers = {"default": renderer}
             self._renderer_names = {"default": type(renderer).__name__}
@@ -136,11 +151,11 @@ class TinkerModel:
         self.model_path = model_path
         self.reasoning = reasoning
         self.max_tokens = max_tokens
-        self.name = f"tinker:{model_path or base_model}"
+        self.name = name or f"tinker:{model_path or base_model}"
         self._types = types
         project_id = project_id or os.environ.get("TINKER_PROJECT_ID") or None
         self.project_id = project_id
-        self._sampler = tinker.ServiceClient(project_id=project_id).create_sampling_client(
+        self._sampler = sampler if sampler is not None else tinker.ServiceClient(project_id=project_id).create_sampling_client(
             base_model=base_model, model_path=model_path)
         self._tokenizer = get_tokenizer(base_model)
         qwen38 = "qwen3.8" in base_model.lower()
@@ -157,7 +172,8 @@ class TinkerModel:
         if self._fixed_params is not None or self._types is None:
             return eff, renderer, self._fixed_params
         max_tokens = self.max_tokens or DEFAULT_MAX_TOKENS.get(eff, 16384)
-        params = self._types.SamplingParams(max_tokens=max_tokens, temperature=0, stop=renderer.get_stop_sequences())
+        params = self._types.SamplingParams(max_tokens=max_tokens, temperature=self.temperature,
+                                            stop=renderer.get_stop_sequences())
         return eff, renderer, params
 
     async def _sample(self, model_input, params):
@@ -181,6 +197,22 @@ class TinkerModel:
 
     async def complete(self, messages: list[dict], effort: str | None = None) -> tuple[str, int, int]:
         eff, renderer, params = self._resolve(effort)
+        content, n_in, n_out, info = await self._complete_once(messages, eff, renderer, params)
+        stepped = []
+        while self.step_down and info.get("parse_error") and "truncated" in info["parse_error"]:
+            lower = next_lower_effort(eff)
+            if lower is None or lower not in self._renderers:
+                break
+            stepped.append(eff)
+            eff, renderer, params = self._resolve(lower)
+            content, more_in, more_out, info = await self._complete_once(messages, eff, renderer, params)
+            n_in, n_out = n_in + more_in, n_out + more_out
+        if stepped:
+            info["stepped_down_from"] = " > ".join(stepped)
+        self.last_info = info
+        return content, n_in, n_out
+
+    async def _complete_once(self, messages: list[dict], eff: str, renderer, params) -> tuple[str, int, int, dict]:
         model_input = renderer.build_generation_prompt(messages)
         response, attempts = await self._sample(model_input, params)
         seq = response.sequences[0]
@@ -206,7 +238,7 @@ class TinkerModel:
             parse_error = ((parse_error or "") + f" truncated at max_tokens={max_tokens} (stop_reason={stop})").strip()
             reasoning = reasoning or content
             content = ""
-        self.last_info = {
+        info = {
             "effort": eff,
             "renderer": self._renderer_names.get(eff),
             "max_tokens": max_tokens,
@@ -215,7 +247,7 @@ class TinkerModel:
             "reasoning": reasoning,
             "attempts": attempts if attempts > 1 else None,
         }
-        return content, model_input.length, len(tokens)
+        return content, model_input.length, len(tokens), info
 
 
 class OpenRouterModel:

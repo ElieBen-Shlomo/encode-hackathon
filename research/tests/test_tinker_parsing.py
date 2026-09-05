@@ -45,7 +45,7 @@ def make_model(renderer, sampler, reasoning="low", max_tokens=None, retries=3):
     m = object.__new__(models.TinkerModel)
     m.base_model, m.model_path, m.reasoning, m.max_tokens = "Qwen/Qwen3.8-27B", None, reasoning, max_tokens
     m.name, m.last_info, m.project_id, m._fixed_params, m.retries = "tinker:test", {}, None, None, retries
-    m.call_timeout = None
+    m.call_timeout, m.temperature, m.step_down = None, 0, True
     m._types = SimpleNamespace(SamplingParams=lambda **kw: SimpleNamespace(**kw))
     m._sampler, m._tokenizer = sampler, SimpleNamespace(decode=lambda toks: "raw")
     m._renderers = {e: renderer for e in models.EFFORTS}
@@ -66,6 +66,7 @@ def test_clean_reply_returns_text_and_keeps_reasoning_for_the_trace():
 def test_truncated_reply_is_never_returned_as_the_answer():
     parts = [{"type": "thinking", "thinking": "We need answer user's request. Need compute..."}]
     m = make_model(FakeRenderer(parts, is_clean=False), FakeSampler(list(range(8192)), "length"), max_tokens=8192)
+    m.step_down = False                                 # the ladder has its own tests below; this one pins the guard
     text, _, n_out = asyncio.run(m.complete(MSGS))
     assert text == ""                                   # nothing for the JSON parser to misread
     assert n_out == 8192
@@ -232,3 +233,68 @@ def test_hung_call_hits_the_deadline_and_is_retried(monkeypatch):
     m.call_timeout = 0.05
     text, _, _ = asyncio.run(m.complete(MSGS))
     assert text == "ok" and sampler.calls[0] == "hang" and m.last_info["attempts"] == 2
+
+
+class TaggedRenderer(FakeRenderer):
+    """One renderer per effort whose prompt carries its tag, so the sampler can truncate per effort."""
+
+    def __init__(self, tag):
+        super().__init__([{"type": "text", "text": f"ok@{tag}"}])
+        self.tag = tag
+
+    def build_generation_prompt(self, messages):
+        return SimpleNamespace(length=100, effort=self.tag)
+
+
+class LadderSampler(FakeSampler):
+    """Cuts the reply off at max_tokens for the efforts in `truncate_for`, answers cleanly otherwise."""
+
+    def __init__(self, truncate_for):
+        super().__init__([1, 2, 3], "stop")
+        self.truncate_for, self.efforts = set(truncate_for), []
+
+    async def sample_async(self, prompt, num_samples, sampling_params):
+        self.efforts.append(prompt.effort)
+        if prompt.effort in self.truncate_for:
+            return SimpleNamespace(sequences=[SimpleNamespace(tokens=[1] * sampling_params.max_tokens, stop_reason="length")])
+        return SimpleNamespace(sequences=[SimpleNamespace(tokens=[1, 2, 3], stop_reason="stop")])
+
+
+def ladder_model(sampler, reasoning):
+    m = make_model(FakeRenderer([]), sampler, reasoning=reasoning)
+    m._renderers = {e: TaggedRenderer(e) for e in models.EFFORTS}
+    return m
+
+
+def test_truncation_steps_down_the_thinking_ladder():
+    sampler = LadderSampler(truncate_for={"xhigh", "medium"})
+    m = ladder_model(sampler, "xhigh")
+    text, _, n_out = asyncio.run(m.complete(MSGS))
+    assert text == "ok@low" and sampler.efforts == ["xhigh", "medium", "low"]
+    assert m.last_info["effort"] == "low" and m.last_info["stepped_down_from"] == "xhigh > medium"
+    assert m.last_info["parse_error"] is None
+    assert n_out == 2 * models.DEFAULT_MAX_TOKENS["xhigh"] + 3      # the trace bills every attempt
+
+
+def test_step_down_stops_after_off_and_still_reports_the_truncation():
+    sampler = LadderSampler(truncate_for=set(models.EFFORTS))
+    m = ladder_model(sampler, "low")
+    text, _, _ = asyncio.run(m.complete(MSGS))
+    assert text == "" and sampler.efforts == ["low", "off"]
+    assert "truncated" in m.last_info["parse_error"] and m.last_info["stepped_down_from"] == "low"
+
+
+def test_step_down_can_be_disabled_and_never_applies_to_a_prebuilt_renderer():
+    sampler = LadderSampler(truncate_for={"low"})
+    m = ladder_model(sampler, "low")
+    m.step_down = False
+    assert asyncio.run(m.complete(MSGS))[0] == "" and sampler.efforts == ["low"]
+    params = SimpleNamespace(max_tokens=50, temperature=0)
+    prebuilt = models.TinkerModel(FakeSampler([1] * 50, "length"), FakeRenderer([{"type": "text", "text": "x"}]), params, "n")
+    assert asyncio.run(prebuilt.complete(MSGS))[0] == "" and "stepped_down_from" not in prebuilt.last_info
+
+
+def test_ladder_order_and_renderer_lookup_match_the_yaml():
+    assert models.EFFORT_BY_RENDERER["qwen3_8_low_reasoning"] == "low"
+    assert [models.next_lower_effort(e) for e in ("xhigh", "medium", "low", "off", "default", None)] == \
+           ["medium", "low", "off", None, None, None]

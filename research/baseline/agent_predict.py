@@ -80,10 +80,10 @@ async def main() -> None:
     params = types.SamplingParams(max_tokens=max_tokens, temperature=temperature, stop=renderer.get_stop_sequences())
 
     from harness import SolveConfig, set_local_limits, solve_task
-    from models import TinkerModel
+    from models import EFFORT_BY_RENDERER, TinkerModel
 
     digest = config.get("digest", "grid")
-    set_local_limits(config.get("libreoffice_concurrency"), config.get("sandbox_concurrency"))
+    set_local_limits(config.get("libreoffice_concurrency"), config.get("sandbox_concurrency"), config.get("reads_concurrency"))
 
     tasks = selected_tasks(Path(args.dataset_dir), parse_ids(args.ids))
     out_dir = Path(args.out_dir)
@@ -92,7 +92,17 @@ async def main() -> None:
                  f"review {review_after_edit} recalc {auto_recalculate} verify {verify_changes} critic {critic_enabled}")
     retries = int(config.get("retries", 6))
     call_timeout = config.get("call_timeout", 900) or None
-    model = TinkerModel(sampler, renderer, params, args.model_path or base_model, retries=retries, call_timeout=call_timeout)
+    name = args.model_path or base_model
+    effort = EFFORT_BY_RENDERER.get(renderer_name)
+    fallback = config.get("fallback_renderers", "auto")
+    ladder = effort is not None and bool(fallback) and str(fallback).lower() not in ("none", "off", "false")
+    if ladder:
+        # one renderer per thinking level, so a reply cut off by max_tokens is retried one level lower
+        model = TinkerModel(sampler, name=name, base_model=base_model, model_path=args.model_path, reasoning=effort,
+                            max_tokens=max_tokens, temperature=temperature, retries=retries, call_timeout=call_timeout)
+    else:
+        model = TinkerModel(sampler, renderer, params, name, retries=retries, call_timeout=call_timeout)
+    log(out_dir, f"renderer {renderer_name}  step-down ladder {'on' if ladder else 'off'}  retries {retries}  call_timeout {call_timeout}")
     critic = None
     if critic_enabled:
         critic_params = types.SamplingParams(max_tokens=critic_max_tokens, temperature=temperature,

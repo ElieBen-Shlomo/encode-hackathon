@@ -5,16 +5,31 @@ budgets are exact. Falls back to a chars/4 estimate inside the slim Docker image
 """
 
 import os
+import threading
 
 MODEL = os.environ.get("TOKENIZER_MODEL", "Qwen/Qwen3.8-27B")
 
 _TOK = None
 _FAILED = False
+_LOCK = threading.Lock()   # first use happens from many render threads at once; load the tokenizer once
 
 
 def _load():
     global _TOK, _FAILED
-    if _TOK is not None or _FAILED:
+    with _LOCK:
+        if _TOK is not None or _FAILED:
+            return _TOK
+        try:
+            from tinker_cookbook.tokenizer_utils import get_tokenizer
+
+            _TOK = get_tokenizer(MODEL)
+        except Exception:
+            try:
+                from transformers import AutoTokenizer
+
+                _TOK = AutoTokenizer.from_pretrained(MODEL)
+            except Exception:
+                _FAILED = True
         return _TOK
     try:
         from tinker_cookbook.tokenizer_utils import get_tokenizer
