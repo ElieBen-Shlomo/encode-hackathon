@@ -4,8 +4,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from sb import (DEFAULT_DATASET, load_answer_values, load_dataset, load_values_at, read_jsonl, recalculate,
-                resolve_output, values_equal)
+from sb import DEFAULT_DATASET, load_answer_values, load_dataset, read_jsonl, recalculate, resolve_output, values_equal
 
 
 @dataclass(frozen=True)
@@ -107,9 +106,9 @@ def score_task(task, output_xlsx, recalc, work_dir):
     try:
         path = recalculate(output_xlsx, work_dir) if recalc else output_xlsx
         gold = load_answer_values(task["golden_xlsx"], task)
-        pred = load_values_at(path, gold)  # golden's cells, so open-ended ranges match up
+        pred = load_answer_values(path, task)
     except Exception as e:
-        return {"status": "error", "error": str(e)[:200], "cells": golden_cell_count(task), "correct": 0}
+        return {"status": "error", "error": str(e)[:200]}
     mismatches = [{"cell": f"{k[0]}!{k[1]}", "expected": g, "actual": pred.get(k)}
                   for k, g in gold.items() if not values_equal(g, pred.get(k))]
     return {
@@ -144,8 +143,7 @@ def score(predictions, tasks, *, recalc=True, oracle=False, predictions_path=Non
 
 def summarise(items):
     graded = [i for i in items if i["status"] == "graded"]
-    counted = [i for i in items if "cells" in i]  # graded plus missing/error, so those lower cell_accuracy
-    scoreable = [i for i in items if i["status"] != "no_golden"]  # ungradable tasks don't dilute pass_rate
+    counted = [i for i in items if "cells" in i]  # graded plus missing, so a missing task lowers cell_accuracy
     n = len(items)
     if items and all(i["status"] == "no_golden" for i in items):
         return {"items": n, "graded": 0, "no_golden": n, "pass_rate": None, "cell_accuracy": None,
@@ -159,10 +157,10 @@ def summarise(items):
         "graded": len(graded),
         "missing": sum(i["status"] in ("missing", "missing_output") for i in items),
         "errors": sum(i["status"] == "error" for i in items),
-        "pass_rate": rate(scoreable),
+        "pass_rate": round(sum(i.get("pass", False) for i in items) / n, 4) if n else None,
         "cell_accuracy": round(sum(i["correct"] for i in counted) / sum(i["cells"] for i in counted), 4) if sum(i["cells"] for i in counted) else None,
-        "pass_rate_cell_level": rate([i for i in scoreable if i["type"].startswith("Cell")]),
-        "pass_rate_sheet_level": rate([i for i in scoreable if i["type"].startswith("Sheet")]),
+        "pass_rate_cell_level": rate([i for i in items if i["type"].startswith("Cell")]),
+        "pass_rate_sheet_level": rate([i for i in items if i["type"].startswith("Sheet")]),
     }
 
 

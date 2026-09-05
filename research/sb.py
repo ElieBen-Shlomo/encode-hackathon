@@ -49,47 +49,26 @@ def _repair_range(rng):
     return rng
 
 
-def expand_range(cell_range, max_row=None, max_col=None):
-    """Expand A1:B3 to cell coordinates. Whole-column (A:G) and whole-row (3:8) ranges
-    need the sheet's max_row / max_col."""
-    min_col, min_row, last_col, last_row = range_boundaries(cell_range)
-    min_col, min_row = min_col or 1, min_row or 1
+def expand_range(cell_range, max_row=None):
+    """Expand A1:B3 to cell coordinates. Whole-column ranges like A:G need max_row."""
+    min_col, min_row, max_col, last_row = range_boundaries(cell_range)
+    min_row = min_row or 1
     last_row = last_row or max_row or min_row
-    last_col = last_col or max_col or min_col
-    return [f"{get_column_letter(c)}{r}" for r in range(min_row, last_row + 1) for c in range(min_col, last_col + 1)]
+    return [f"{get_column_letter(c)}{r}" for r in range(min_row, last_row + 1) for c in range(min_col, max_col + 1)]
 
 
 def answer_ranges(task):
     return [(sheet or task.get("answer_sheet"), rng) for sheet, rng in parse_answer_position(task["answer_position"])]
 
 
-def split_sheet_field(field):
-    """Some tasks pack several sheet names into one field: "Consolidated Tracker,Existing Task,..."."""
-    if not field:
-        return []
-    return [part.strip().strip("'\"") for part in str(field).split(",") if part.strip().strip("'\"")]
-
-
-def _resolve_sheets(sheet, wb):
-    """Sheet field -> sheet titles in wb. An exact match wins (sheet names may themselves contain
-    commas); otherwise a comma-joined field whose every part is a real sheet means all of them."""
-    if wb is None or not sheet or sheet in wb.sheetnames:
-        return [sheet]
-    parts = split_sheet_field(sheet)
-    if len(parts) > 1 and all(part in wb.sheetnames for part in parts):
-        return parts
-    return [sheet]
-
-
 def answer_cells(task, wb=None):
     cells = []
     for sheet, rng in answer_ranges(task):
-        for resolved in _resolve_sheets(sheet, wb):
-            max_row = max_col = None
-            if wb is not None:
-                ws = wb[resolved] if resolved and resolved in wb.sheetnames else wb.active
-                max_row, max_col = ws.max_row, ws.max_column
-            cells.extend((resolved, coord) for coord in expand_range(rng, max_row, max_col))
+        max_row = None
+        if wb is not None:
+            ws = wb[sheet] if sheet and sheet in wb.sheetnames else wb.active
+            max_row = ws.max_row
+        cells.extend((sheet, coord) for coord in expand_range(rng, max_row))
     return cells
 
 
@@ -99,18 +78,6 @@ def load_answer_values(path, task):
     for sheet, coord in answer_cells(task, wb):
         ws = wb[sheet] if sheet and sheet in wb.sheetnames else wb.active
         out[(ws.title, coord)] = ws[coord].value
-    return out
-
-
-def load_values_at(path, keys):
-    """Read cells at the given (sheet title, coord) keys. Grading passes the golden's keys so
-    both workbooks are read at the same cells even for open-ended ranges like A:G, whose
-    expansion would otherwise follow each file's own max_row."""
-    wb = openpyxl.load_workbook(path, data_only=True)
-    out = {}
-    for sheet, coord in keys:
-        ws = wb[sheet] if sheet in wb.sheetnames else wb.active
-        out[(sheet, coord)] = ws[coord].value
     return out
 
 
