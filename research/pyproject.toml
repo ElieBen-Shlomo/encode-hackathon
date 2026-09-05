@@ -7,6 +7,7 @@ dependencies = [
     "opentelemetry-exporter-otlp>=1.44.0",
     "opentelemetry-sdk>=1.44.0",
     "pydantic-ai-slim[openrouter]>=2.38.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
