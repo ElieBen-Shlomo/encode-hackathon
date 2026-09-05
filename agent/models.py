@@ -9,11 +9,14 @@ class MockModel:
     name = "mock"
 
     async def complete(self, messages: list[dict]) -> tuple[str, int, int]:
-        tool_results = sum(m.get("role") == "user" and "Tool result" in str(m.get("content")) for m in messages)
-        if tool_results:
+        completed_edit = any(
+            m.get("role") == "user" and "Required independent review" in str(m.get("content"))
+            for m in messages
+        )
+        if completed_edit:
             return json.dumps({"tool": "finish", "args": {"summary": "mock completed"}}), 0, 0
-        code = "import openpyxl\nwb = openpyxl.load_workbook(OUT_XLSX)\nwb.save(OUT_XLSX)\n"
-        return json.dumps({"tool": "run_python", "args": {"code": code}}), 0, 0
+        code = "import os\nimport openpyxl\nout=os.environ['OUT_XLSX']\nwb=openpyxl.load_workbook(out)\nwb.save(out)\n"
+        return json.dumps({"tool": "run_python", "args": {"mode": "edit", "expected_changes": [], "code": code}}), 0, 0
 
 
 class TinkerModel:
