@@ -68,12 +68,30 @@ def build_prompt(task: dict) -> str:
 
 
 def parse_answer(text: str) -> SpreadsheetAnswer:
-    """First {...} block in the reply. Thinking models wrap it in prose or code fences."""
+    """Cells from the reply. Thinking models wrap the JSON in prose or code fences.
+
+    Walks every {...} in the reply with raw_decode instead of slicing first-brace to
+    last-brace: prose braces no longer shift the start, and a reply truncated by
+    max_tokens still yields the cells it did emit rather than losing the whole task.
+    """
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end < 0:
-        raise ValueError(f"no JSON object in reply: {text[:120]!r}")
-    return SpreadsheetAnswer.model_validate(json.loads(text[start:end + 1]))
+    decoder = json.JSONDecoder()
+    cells: list[dict] = []
+    i = 0
+    while (i := text.find("{", i)) >= 0:
+        try:
+            obj, end = decoder.raw_decode(text, i)
+        except ValueError:
+            i += 1
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("cells"), list):
+            return SpreadsheetAnswer.model_validate(obj)
+        if isinstance(obj, dict) and "cell" in obj:
+            cells.append(obj)
+        i = end
+    if not cells:
+        raise ValueError(f"no cell objects in reply: {text[:120]!r}")
+    return SpreadsheetAnswer.model_validate({"cells": cells})
 
 
 def write_output(task: dict, answer: SpreadsheetAnswer, out_path: Path) -> None:
