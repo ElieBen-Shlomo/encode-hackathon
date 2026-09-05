@@ -12,6 +12,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from guard import assert_safe_input
+
 TAIL = 4000  # chars of stdout+stderr kept for the repair prompt
 
 
@@ -24,6 +26,7 @@ def clean_env(tmp_home: str) -> dict:
 
 def run_code(code: str, in_xlsx: str, out_xlsx: str, timeout: int = 120) -> tuple[bool, str]:
     """Run the script, return (ok, combined output tail). OUT_XLSX must exist afterwards."""
+    assert_safe_input(in_xlsx)  # the model's script gets IN_XLSX; never let it be a golden/answer (DQ)
     shutil.copy(in_xlsx, out_xlsx)
     with tempfile.TemporaryDirectory() as td:
         script = Path(td) / "transform.py"

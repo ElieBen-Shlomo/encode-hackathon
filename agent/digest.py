@@ -8,6 +8,7 @@ import openpyxl
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import range_boundaries
 
+from guard import assert_safe_input
 from sb import answer_ranges
 
 HEAD_ROWS = 30
@@ -48,6 +49,7 @@ def _answer_rows(task, sheet_title: str, max_row: int) -> set[int]:
 
 
 def digest(path: str, task: dict) -> str:
+    assert_safe_input(path)  # never serialize a golden/answer file into the prompt (DQ)
     wb = openpyxl.load_workbook(path, data_only=True)
     parts = []
     for ws in wb.worksheets:
