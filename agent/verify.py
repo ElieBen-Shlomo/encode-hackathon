@@ -36,6 +36,53 @@ def formula_cells(path: str, task: dict) -> list[str]:
     return found
 
 
+EXCEL_ERRORS = {"#NAME?", "#VALUE!", "#N/A", "#REF!", "#DIV/0!", "#NULL!", "#NUM!", "#SPILL!", "#CALC!"}
+
+
+def error_cells_in_answer_range(path: str, task: dict) -> list[str]:
+    """Graded cells whose recalculated value is an Excel error string.
+
+    formula_cells only reports that a formula exists; this checks what it actually produced,
+    using the cached (post-recalculation) value so a broken formula can't slip through unnoticed.
+    """
+    wb = openpyxl.load_workbook(path, data_only=True)
+    found = []
+    for sheet, cell_range in answer_ranges(task):
+        if sheet not in wb.sheetnames:
+            continue
+        for cell in _range_cells(wb[sheet], cell_range):
+            if isinstance(cell.value, str) and cell.value.strip() in EXCEL_ERRORS:
+                found.append(f"{sheet}!{cell.coordinate}={cell.value}")
+    return found
+
+
+def answer_range_coverage(init_path: str, current_path: str, task: dict) -> str:
+    """Per-column count of graded cells still identical to the initial workbook.
+
+    A cumulative check against the task's starting state (not just this edit's diff), so a
+    column the model never touched across any turn is surfaced explicitly instead of silently
+    shipping unchanged.
+    """
+    init = openpyxl.load_workbook(init_path, data_only=False)
+    cur = openpyxl.load_workbook(current_path, data_only=False)
+    lines = []
+    for sheet, cell_range in answer_ranges(task):
+        if sheet not in cur.sheetnames or sheet not in init.sheetnames:
+            lines.append(f"{sheet!r}!{cell_range}: SHEET MISSING")
+            continue
+        by_col: dict[str, list[int]] = defaultdict(lambda: [0, 0])  # col letter -> [untouched, total]
+        for cell in _range_cells(cur[sheet], cell_range):
+            col = "".join(ch for ch in cell.coordinate if ch.isalpha())
+            init_cell = init[sheet][cell.coordinate]
+            by_col[col][1] += 1
+            if _cell_value(cell) == _cell_value(init_cell):
+                by_col[col][0] += 1
+        stale = [f"{col}: {untouched}/{total} unchanged" for col, (untouched, total) in sorted(by_col.items()) if untouched == total]
+        if stale:
+            lines.append(f"{sheet}: columns fully untouched since start (still identical to initial workbook) — {', '.join(stale)}")
+    return "\n".join(lines) if lines else "All declared columns have at least one edited cell."
+
+
 def _normalise_expected_ranges(task: dict, expected_changes: list[str] | None) -> dict[str, list[str]]:
     result: dict[str, list[str]] = defaultdict(list)
     for item in expected_changes or []:
