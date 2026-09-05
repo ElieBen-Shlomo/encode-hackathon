@@ -23,6 +23,7 @@ cd research && uv run --with pytest pytest tests -q
 | `test_analysis.py` | failure attribution buckets, paired bootstrap, reading-probe generator and grader |
 | `test_config_defaults.py` | the shipped defaults are the study's pick: `SolveConfig`, `run.py` flags, `qwen.yaml`, the Docker image installs the `tinker` extra, local-limit API (None keeps, 0 is an error) |
 | `test_local_concurrency.py` | per-kind thread pools bound what actually runs, cheap reads never queue behind sandbox waits, finished event loops are released, the render cache survives concurrent eviction |
+| `test_teacher_sft.py` | `teacher/build_sft.py` replays a verified teacher script into a trajectory rendered with the inference view (`SolveConfig()`, grid) and the harness protocol; reference workbooks stay closed (`needs_recalc` stubbed) |
 
 ## Expected failures (documented gaps, `xfail(strict=True)`)
 
