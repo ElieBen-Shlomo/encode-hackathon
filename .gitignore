@@ -10,3 +10,5 @@ __pycache__/
 # datasets: raw downloads and generated train/test folders (large / reproducible)
 datasets/raw/
 datasets/400/
+!/results.json
+research/eval/task_features.csv

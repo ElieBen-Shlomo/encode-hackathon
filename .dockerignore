@@ -5,3 +5,6 @@ research/submissions/
 **/__pycache__/
 .env
 *.tar.gz
+research/private/
+research/eval/task_features.csv
+agent/show.py
