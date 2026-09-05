@@ -1,4 +1,4 @@
-"""Tinker Qwen runner with values-only baseline and local tool-agent modes.
+"""One-shot values-only Tinker Qwen baseline.
 
     uv sync --extra tinker
     uv run baseline/tinker_predict.py --out-dir submissions/qwen3-8b --ids 13-1,51-12
@@ -7,29 +7,22 @@
 
 Needs TINKER_API_KEY in .env. The base model picks the tokenizer and chat template. Writes the same
 files as llm_predict.py. Inference defaults live in config/qwen.yaml; command-line flags override them.
-
-``mode: agent`` gives Qwen up to ``max_turns`` to inspect and edit a copied workbook with
-local Python, Bash, and LibreOffice-recalculation tools. Model-written commands run on the host.
+For the local Python/Bash tool agent, use baseline/agent_predict.py instead.
 """
 
 import argparse
 import asyncio
-import shutil
-import sys
 from pathlib import Path
 
 import tinker
 import yaml
-from common import FORMAT_HINT, SYSTEM_PROMPT, append_jsonl, load_env, log, parse_ids, prepare_out_dir, run, selected_tasks
+from common import FORMAT_HINT, SYSTEM_PROMPT, load_env, parse_ids, run, selected_tasks
 from tinker import types
 from tinker_cookbook import renderers
 from tinker_cookbook.model_info import get_recommended_renderer_name
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
 from sb import DEFAULT_DATASET
-
-AGENT_DIR = Path(__file__).resolve().parents[2] / "agent"
-sys.path.insert(0, str(AGENT_DIR))
 
 
 def load_config(path: Path) -> dict:
@@ -48,15 +41,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset-dir", default=str(DEFAULT_DATASET))
     p.add_argument("--ids", help="comma-separated task ids (default: all)")
     p.add_argument("--config", default="config/qwen.yaml", help="YAML inference settings file")
-    p.add_argument("--mode", choices=["values", "agent"], help="values-only baseline or local Python/Bash tool agent")
     p.add_argument("--base-model", help="e.g. Qwen/Qwen3-8B")
     p.add_argument("--model-path", help="tinker://... sampler checkpoint. Omit to sample the base model.")
     p.add_argument("--project-id", help="Tinker project ID for the sampling session (uses Tinker's default project if omitted)")
     p.add_argument("--concurrency", type=int, help="parallel requests")
     p.add_argument("--max-tokens", type=int, help="sheet-level tasks need long replies")
     p.add_argument("--temperature", type=float, help="sampling temperature")
-    p.add_argument("--max-turns", type=int, help="maximum Qwen turns per task in agent mode")
-    p.add_argument("--tool-timeout", type=int, help="seconds allowed for each Python or Bash tool call")
     return p.parse_args()
 
 
@@ -71,9 +61,6 @@ async def main():
     concurrency = args.concurrency if args.concurrency is not None else config.get("concurrency", 4)
     max_tokens = args.max_tokens if args.max_tokens is not None else config.get("max_tokens", 8192)
     temperature = args.temperature if args.temperature is not None else config.get("temperature", 0)
-    mode = args.mode or config.get("mode", "values")
-    max_turns = args.max_turns if args.max_turns is not None else config.get("max_turns", 20)
-    tool_timeout = args.tool_timeout if args.tool_timeout is not None else config.get("tool_timeout", 120)
     renderer_name = config.get("renderer") or get_recommended_renderer_name(base_model)
     print(f"Tinker project ID: {project_id or '<default project>'}", flush=True)
     sampler = tinker.ServiceClient(project_id=project_id).create_sampling_client(
@@ -93,33 +80,7 @@ async def main():
         return content, model_input.length, len(tokens)
 
     tasks = selected_tasks(Path(args.dataset_dir), parse_ids(args.ids))
-    out_dir = Path(args.out_dir)
-    if mode == "values":
-        await run(complete, args.model_path or base_model, tasks, out_dir, concurrency)
-        return
-
-    from harness import solve_task
-    from models import TinkerModel
-
-    prepare_out_dir(out_dir)
-    log(out_dir, f"mode agent  model {args.model_path or base_model}  tasks {len(tasks)}  max_turns {max_turns}")
-    model = TinkerModel(sampler, renderer, params, args.model_path or base_model)
-    semaphore = asyncio.Semaphore(concurrency)
-
-    async def run_one(task: dict) -> None:
-        async with semaphore:
-            try:
-                status = await solve_task(model, task, out_dir, max_turns=max_turns, tool_timeout=tool_timeout)
-            except Exception as exc:
-                shutil.copy(task["init_xlsx"], out_dir / "outputs" / f"{task['id']}.xlsx")
-                append_jsonl(out_dir / "predictions.jsonl", {
-                    "id": task["id"], "output": f"outputs/{task['id']}.xlsx",
-                    "status": f"error: harness crash: {exc}"[:200],
-                })
-                status = f"error: harness crash: {exc}"[:80]
-        log(out_dir, f"{task['id']:<8} {status}")
-
-    await asyncio.gather(*(run_one(task) for task in tasks))
+    await run(complete, args.model_path or base_model, tasks, Path(args.out_dir), concurrency)
 
 
 if __name__ == "__main__":

@@ -87,13 +87,13 @@ uv run evaluate.py --predictions submissions/my-llm/predictions.jsonl --no-recal
 
 ### Local Qwen tool agent
 
-`baseline/tinker_predict.py` also supports a local tool-agent mode, configured in `config/qwen.yaml`.
-In `mode: agent`, Qwen can inspect a workbook and run Python, Bash, or LibreOffice recalculation
+`baseline/agent_predict.py` is a local Qwen tool agent, configured in `config/qwen.yaml`.
+Qwen can inspect a workbook and run Python, Bash, or LibreOffice recalculation
 against a copied output workbook for up to `max_turns` model turns. It writes the same predictions,
 outputs, traces, and run log as the baseline; every model and tool call is recorded in the task trace.
 
 ```sh
-uv run baseline/tinker_predict.py --mode agent --out-dir submissions/qwen-agent --ids 13-1,51-12
+uv run baseline/agent_predict.py --out-dir submissions/qwen-agent --ids 13-1,51-12
 ```
 
 This mode executes model-written commands on the local host. It must not read golden workbooks or
