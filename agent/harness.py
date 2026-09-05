@@ -1,5 +1,6 @@
 """Multi-turn local tool agent for SpreadsheetBench tasks."""
 
+import asyncio
 import json
 import shutil
 import tempfile
@@ -120,7 +121,7 @@ async def solve_task(model, task: dict, out_dir: Path, *, max_turns: int = 20, t
     run = TaskRun(task, out_dir)
     shutil.copy(task["init_xlsx"], run.out_xlsx)
     try:
-        messages = build_messages(task)
+        messages = await asyncio.to_thread(build_messages, task)
     except Exception as exc:
         run.trace(error=f"digest failed: {type(exc).__name__}: {exc}"[:500])
         run.prediction(f"error: digest failed: {exc}"[:200])
@@ -129,6 +130,11 @@ async def solve_task(model, task: dict, out_dir: Path, *, max_turns: int = 20, t
     status = "error: turn limit reached"
     with tempfile.TemporaryDirectory(prefix=f"spreadsheet-agent-{task['id']}-") as temp:
         work_dir = Path(temp)
+        # Model code gets a read-only copy, never the real dataset file: outside Docker the
+        # dataset is writable and a stray save to IN_XLSX would silently poison every later run.
+        in_copy = work_dir / Path(task["init_xlsx"]).name
+        shutil.copy(task["init_xlsx"], in_copy)
+        in_copy.chmod(0o444)
         for turn in range(1, max_turns + 1):
             text = await complete(model, run, messages)
             if text is None:
@@ -146,7 +152,7 @@ async def solve_task(model, task: dict, out_dir: Path, *, max_turns: int = 20, t
 
             tool, args = action["tool"], action["args"]
             if tool == "finish":
-                if output_is_readable(run.out_xlsx):
+                if await asyncio.to_thread(output_is_readable, run.out_xlsx):
                     run.trace(model=model.name, tool="finish", tool_input=args, tool_output="workbook accepted")
                     run.prediction("ok")
                     return "ok"
@@ -156,25 +162,29 @@ async def solve_task(model, task: dict, out_dir: Path, *, max_turns: int = 20, t
                 status = "error: unreadable output"
                 continue
 
+            # Tools run in a worker thread: subprocess.run, LibreOffice and openpyxl loads
+            # otherwise block the event loop and stall every other concurrent task.
             if tool == "inspect_workbook":
                 try:
-                    ok, result = True, digest(str(run.out_xlsx), task)
+                    ok, result = True, await asyncio.to_thread(digest, str(run.out_xlsx), task)
                 except Exception as exc:
                     ok, result = False, f"{type(exc).__name__}: {exc}"
             elif tool == "run_python" and isinstance(args.get("code"), str):
-                ok, result = run_python(args["code"], work_dir=work_dir, in_xlsx=task["init_xlsx"],
-                                        out_xlsx=str(run.out_xlsx), turn=turn, timeout=tool_timeout)
+                ok, result = await asyncio.to_thread(
+                    run_python, args["code"], work_dir=work_dir, in_xlsx=str(in_copy),
+                    out_xlsx=str(run.out_xlsx), turn=turn, timeout=tool_timeout)
             elif tool == "run_bash" and isinstance(args.get("command"), str):
-                ok, result = run_bash(args["command"], work_dir=work_dir, in_xlsx=task["init_xlsx"],
-                                      out_xlsx=str(run.out_xlsx), timeout=tool_timeout)
+                ok, result = await asyncio.to_thread(
+                    run_bash, args["command"], work_dir=work_dir, in_xlsx=str(in_copy),
+                    out_xlsx=str(run.out_xlsx), timeout=tool_timeout)
             elif tool == "recalculate_workbook":
-                ok, result = recalculate_output(run.out_xlsx, work_dir)
+                ok, result = await asyncio.to_thread(recalculate_output, run.out_xlsx, work_dir)
             else:
                 ok, result = False, f"Unknown tool or invalid args: {tool}"
 
             if ok and tool in {"run_python", "run_bash", "recalculate_workbook"}:
                 try:
-                    result += "\n\n## Updated workbook digest\n" + digest(str(run.out_xlsx), task)
+                    result += "\n\n## Updated workbook digest\n" + await asyncio.to_thread(digest, str(run.out_xlsx), task)
                 except Exception as exc:
                     result += f"\n\nUnable to digest updated workbook: {type(exc).__name__}: {exc}"
             run.trace(model=model.name, tool=tool, tool_input=args, tool_output=result,
@@ -182,7 +192,7 @@ async def solve_task(model, task: dict, out_dir: Path, *, max_turns: int = 20, t
             tool_result(messages, tool, result)
             status = "error: tool failed" if not ok else "error: turn limit reached"
 
-    if not output_is_readable(run.out_xlsx):
+    if not await asyncio.to_thread(output_is_readable, run.out_xlsx):
         shutil.copy(task["init_xlsx"], run.out_xlsx)
         status = "error: output unreadable"
     run.prediction(status[:200])
