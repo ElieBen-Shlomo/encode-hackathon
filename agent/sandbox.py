@@ -24,6 +24,9 @@ def clean_env(tmp_home: str) -> dict:
 
 def run_code(code: str, in_xlsx: str, out_xlsx: str, timeout: int = 120) -> tuple[bool, str]:
     """Run the script, return (ok, combined output tail). OUT_XLSX must exist afterwards."""
+    # absolute: the script runs with cwd set to its own temp dir, so relative paths
+    # from a relative --out-dir would not resolve there
+    in_xlsx, out_xlsx = str(Path(in_xlsx).resolve()), str(Path(out_xlsx).resolve())
     shutil.copy(in_xlsx, out_xlsx)
     with tempfile.TemporaryDirectory() as td:
         script = Path(td) / "transform.py"
