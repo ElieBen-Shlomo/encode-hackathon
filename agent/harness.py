@@ -12,7 +12,7 @@ from digest import digest, verification_snapshot
 from sandbox import run_bash, run_python
 from skills import selected_skills
 from sb import recalculate
-from verify import diff_workbooks, formula_cells, format_verification
+from verify import answer_range_coverage, diff_workbooks, error_cells_in_answer_range, formula_cells, format_verification
 from workbook_tools import assert_blank, assert_sorted, inspect_range
 
 TRACE_TEXT_CAP = 20_000
@@ -36,7 +36,9 @@ Python and Bash run locally in a persistent task workspace. They receive IN_XLSX
 
 Use mode=inspect for diagnostics that do not change OUT_XLSX. Use mode=edit only when changing it, and declare the target ranges in expected_changes. For iterative rules, first run an inspect simulation that prints intermediate state before editing. “At least”, “no less than”, and equivalent boundaries are inclusive: use >= and a small float tolerance when appropriate.
 
-Do not access golden workbooks, make network requests, or use web lookup. After every successful edit, independently re-read the instruction and inspect deterministic verification plus the grading-focused snapshot. Repair any issue before finishing. The harness recalculates formula cells in the graded range automatically."""
+Only grading cell values matter, not whether they came from a formula. Prefer computing the answer in Python and writing the literal result into graded cells; write a live formula only when the instruction explicitly asks for one. This avoids two common failure classes: functions newer than Excel 2007 need the exact `_xlfn.` prefix openpyxl requires when written directly — `_xlfn.XLOOKUP`, `_xlfn.UNIQUE`, `_xlfn.LET`, `_xlfn.TEXTSPLIT`, `_xlfn.TEXTJOIN`, `_xlfn.CHOOSECOLS`, `_xlfn._xlws.FILTER` — classic functions (SUM, SUMIFS, INDEX, MATCH, VLOOKUP, LOOKUP, AGGREGATE) need none; and array-style formulas (whole-column INDEX/MATCH tricks, LOOKUP(2,1/(...)), DATEVALUE over a range) only evaluate correctly with CSE array entry, which is easy to get wrong. If you do write a formula, verify its recalculated value is not an error string before finishing.
+
+Do not access golden workbooks, make network requests, or use web lookup. After every successful edit, independently re-read the instruction and inspect deterministic verification plus the grading-focused snapshot. The verification includes a formula-error check and a per-column answer-range coverage report — a column reported as fully unchanged since the initial workbook usually means you missed part of the task; confirm it should genuinely stay blank before finishing. Repair any issue before finishing. The harness recalculates formula cells in the graded range automatically and blocks finish while a graded cell still evaluates to an error."""
 
 
 def build_messages(task: dict) -> list[dict]:
@@ -261,6 +263,14 @@ async def solve_task(model, task: dict, out_dir: Path, *, max_turns: int = 20, t
                 diff = diff_workbooks(str(before_edit), str(run.out_xlsx), task, args.get("expected_changes") if verify_changes else None)
                 formulas = formula_cells(str(run.out_xlsx), task)
                 verification = format_verification(diff, formulas)
+                error_cells = error_cells_in_answer_range(str(run.out_xlsx), task)
+                coverage = answer_range_coverage(task["init_xlsx"], str(run.out_xlsx), task)
+                if error_cells:
+                    verification += (f"\n\n## GRADED CELLS CONTAIN FORMULA ERRORS\n{', '.join(error_cells[:20])}\n"
+                                      "These cells will score as wrong. Repair before finishing.")
+                # Warning only, not a hard block: a graded column can legitimately stay blank by
+                # design, so forcing repair here risks a deadlock that burns every remaining turn.
+                verification += f"\n\n## Answer range coverage\n{coverage}"
                 try:
                     snapshot = verification_snapshot(str(run.out_xlsx), task)
                 except Exception as exc:
@@ -268,7 +278,7 @@ async def solve_task(model, task: dict, out_dir: Path, *, max_turns: int = 20, t
                 last_evidence = f"## Last tool output\n{result}\n\n{verification}\n\n{snapshot}"
                 result = last_evidence
                 edit_generation += 1
-                repair_required = False
+                repair_required = bool(error_cells)
                 if review_after_edit:
                     review_pending = True
 
